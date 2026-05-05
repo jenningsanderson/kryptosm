@@ -102,14 +102,6 @@ Examples:
         help="Spark master URL (default: local[*])",
     )
 
-    # Processing options
-    parser.add_argument(
-        "--partition-number",
-        type=int,
-        default=200,
-        help="Number of partitions for output (default: 200)",
-    )
-
     return parser
 
 

@@ -4,27 +4,27 @@ E2E Test Stage 2: Build Ways
 Tests building way geometries by reading nodes from Iceberg and ways from Parquet.
 """
 
-import sys
 import os
+import sys
 from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kryptosm.spark import create_spark_session_for_testing
-from kryptosm.iceberg import table_exists, get_table_count
-from kryptosm.geometry import (
+from kryptosm.geometry.iceberg_prep import prepare_for_iceberg
+from kryptosm.geometry.ways import (
     build_linestring_for_ways,
     build_ways_geometry_from_linestring,
-    prepare_for_iceberg,
+    flatten_way_refs,
 )
-
+from kryptosm.iceberg import get_table_count, table_exists
+from kryptosm.spark import create_spark_session_for_testing
 
 # Paths
 TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
 OUTPUT_DIR = Path(__file__).parent / "data" / "output"
 WAREHOUSE_DIR = OUTPUT_DIR / "warehouse"
-TABLE_NAME = "hadoop_catalog.test_db.e2e_nodes"  # Same table as nodes
+TABLE_NAME = "hadoop_catalog.test_db.e2e_osm"
 
 
 def test_build_ways():
@@ -40,7 +40,7 @@ def test_build_ways():
 
     # Create Spark session
     print("\n1. Creating Spark session...")
-    spark = create_spark_session_for_testing(str(WAREHOUSE_DIR), use_sedona_jars=True)
+    spark = create_spark_session_for_testing(str(WAREHOUSE_DIR))
     print("   Spark session created")
 
     try:
@@ -64,8 +64,8 @@ def test_build_ways():
         # Load nodes from Iceberg
         print("\n3. Loading nodes from Iceberg...")
         spark.sql(f"""
-            SELECT id, version, timestamp, uid, user, changeset, tags, lat, lon, 
-                   refs, members, latest_ts, 
+            SELECT id, version, timestamp, uid, user, changeset, tags, lat, lon,
+                   refs, members, latest_ts,
                    ST_GeomFromWKB(geometry) AS geom
             FROM {TABLE_NAME}
             WHERE type = 'node'
@@ -77,7 +77,8 @@ def test_build_ways():
         ways_df = spark.read.parquet(str(TEST_PARQUET_PATH / "type=way"))
         way_count = ways_df.count()
         print(f"   Loaded {way_count:,} ways")
-        ways_df.createOrReplaceTempView("input_ways")
+        ways_df.createOrReplaceTempView("input_ways_raw")
+        flatten_way_refs(spark, "input_ways_raw", "input_ways")
 
         # Build way geometries
         print("\n5. Building way linestrings...")
@@ -96,7 +97,7 @@ def test_build_ways():
 
         # Prepare for Iceberg
         print("\n7. Preparing ways for Iceberg...")
-        prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final", partition_number=4)
+        prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final")
         final_count = spark.sql("SELECT COUNT(*) as c FROM ways_final").collect()[0]["c"]
         print(f"   Prepared {final_count:,} ways")
 

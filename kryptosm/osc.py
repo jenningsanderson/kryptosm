@@ -1,326 +1,181 @@
 """
-OSC (OpenStreetMap Change) file handling.
+OSC (OpenStreetMap Change) ingestion.
+
+OSC files are XML, so parsing is Python. Once parsed, everything is a Spark
+DataFrame and downstream logic stays in SQL.
 """
 
+import gzip
 from datetime import datetime, timezone
-from gzip import GzipFile
 from posixpath import join as urljoin
 from xml.etree import ElementTree
-from typing import Optional
 
 import pyspark.sql.types as T
 import requests
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
+
+
+# Reference point for the OSC daily-replication sequence number.
+_REF_DATE = datetime(2024, 3, 23, tzinfo=timezone.utc)
+_REF_SEQ = 4210
+_REPLICATION_BASE = "https://planet.openstreetmap.org/replication/day/"
+
+OSC_SCHEMA = T.StructType([
+    T.StructField("id", T.LongType(), False),
+    T.StructField("type", T.StringType(), False),
+    T.StructField("op", T.StringType(), False),
+    T.StructField("version", T.LongType(), True),
+    T.StructField("timestamp", T.StringType(), True),
+    T.StructField("uid", T.LongType(), True),
+    T.StructField("user", T.StringType(), True),
+    T.StructField("changeset", T.LongType(), True),
+    T.StructField("tags", T.MapType(T.StringType(), T.StringType()), True),
+    T.StructField("lat", T.DoubleType(), True),
+    T.StructField("lon", T.DoubleType(), True),
+    T.StructField("refs", T.ArrayType(T.LongType()), True),
+    T.StructField(
+        "members",
+        T.ArrayType(
+            T.StructType([
+                T.StructField("type", T.StringType(), True),
+                T.StructField("ref", T.LongType(), True),
+                T.StructField("role", T.StringType(), True),
+            ])
+        ),
+        True,
+    ),
+    T.StructField("latest_ts", T.StringType(), True),
+])
 
 
 def osc_dedup(spark: SparkSession, osc_view: str, result_view: str):
     """
-    Deduplicate OSC data by keeping the latest version per id+type.
+    Keep the latest version per (id, type) from the OSC stream.
 
-    Args:
-        spark: Spark session
-        osc_view: Name of the view containing OSC data
-        result_view: Name of the view to create with deduplicated data
+    Also casts the OSC's ISO-string timestamps into TIMESTAMP so that all
+    downstream views match the Iceberg table's TIMESTAMP columns. This is
+    the single funnel for OSC data, so doing the cast here means every
+    consumer (`all_dirty_ways`, `apply_osc_with_geometry`, `build_*`,
+    ...) sees the canonical type.
+
+    Input view (`osc_view`) columns:
+        id, type, op, version, timestamp (STRING), uid, user, changeset,
+        tags, lat, lon, refs, members, latest_ts (STRING)
+    Output view (`result_view`) columns:
+        same shape, but `timestamp` and `latest_ts` are TIMESTAMP.
     """
     spark.sql(f"""
         SELECT
             id,
             type,
-            max_by(op, version) AS op,
-            max(version) AS version,
-            max_by(timestamp, version) AS timestamp,
-            max_by(uid, version) AS uid,
-            max_by(user, version) AS user,
-            max_by(changeset, version) AS changeset,
-            max_by(tags, version) AS tags,
-            max_by(lat, version) AS lat,
-            max_by(lon, version) AS lon,
-            max_by(refs, version) AS refs,
-            max_by(members, version) AS members,
-            max_by(timestamp, version) AS latest_ts
+            max_by(op, version)                          AS op,
+            max(version)                                 AS version,
+            CAST(max_by(timestamp, version) AS TIMESTAMP) AS timestamp,
+            max_by(uid, version)                         AS uid,
+            max_by(user, version)                        AS user,
+            max_by(changeset, version)                   AS changeset,
+            max_by(tags, version)                        AS tags,
+            max_by(lat, version)                         AS lat,
+            max_by(lon, version)                         AS lon,
+            max_by(refs, version)                        AS refs,
+            max_by(members, version)                     AS members,
+            CAST(max_by(timestamp, version) AS TIMESTAMP) AS latest_ts
         FROM {osc_view}
         GROUP BY id, type
-        """).createOrReplaceTempView(result_view)
+    """).createOrReplaceTempView(result_view)
 
 
 def get_osc_day_sequence_number(publish_date: str) -> int:
-    """
-    Calculate OSC sequence number from date.
-    Reference: 2024-03-23 = sequence 4210
-
-    Args:
-        publish_date: Date string in YYYY-MM-DD format
-
-    Returns:
-        Sequence number
-    """
-    ref_date = datetime(2024, 3, 23, tzinfo=timezone.utc)
-    ref_seq = 4210
-    target_date = datetime.strptime(publish_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    days_diff = (target_date - ref_date).days
-    return ref_seq + days_diff
+    """Convert a YYYY-MM-DD date to the OSM daily-replication sequence number."""
+    target = datetime.strptime(publish_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return _REF_SEQ + (target - _REF_DATE).days
 
 
-class OSCData:
-    """Handles OpenStreetMap replication files."""
-
-    def __init__(self, file_path=None, frequency="day", sequence_number=None):
-        self.frequency = frequency
-        self.base_url = f"https://planet.openstreetmap.org/replication/{frequency}/"
-
-        if file_path:
-            self.file_path = file_path
-            self.data = self._read_osc_data()
-        elif sequence_number:
-            self.sequence_number = sequence_number
-            self.data = self._read_osc_data()
-        else:
-            raise ValueError("Either file_path or sequence_number must be provided")
-
-    def _build_osc_url(self, sequence_number):
-        """Build URL for OSC file."""
-        seq_str = str(sequence_number).zfill(9)
-        return urljoin(self.base_url, f"{seq_str[:3]}/{seq_str[3:6]}/{seq_str[6:9]}.osc.gz")
-
-    def _read_osc_data(self):
-        """Download and parse OSC data."""
-        if hasattr(self, "file_path"):
-            # Read from local file
-            if self.file_path.startswith("s3://"):
-                # TODO: Implement S3 reading
-                raise NotImplementedError("S3 OSC files not yet implemented")
-            else:
-                with GzipFile(self.file_path, "rb") as f:
-                    xml_content = f.read()
-        else:
-            # Download from URL
-            url = self._build_osc_url(self.sequence_number)
-            print(f"Downloading OSC from: {url}")
-            response = requests.get(url)
-            response.raise_for_status()
-
-            import gzip
-
-            xml_content = gzip.decompress(response.content)
-
-        return self._parse_osc_xml(xml_content)
-
-    def _parse_osc_xml(self, xml_content):
-        """Parse OSC XML into structured data."""
-        data = {
-            "create": {"node": [], "way": [], "relation": []},
-            "modify": {"node": [], "way": [], "relation": []},
-            "delete": {"node": [], "way": [], "relation": []},
-        }
-
-        root = ElementTree.fromstring(xml_content)
-
-        for action in root:
-            op = action.tag  # create, modify, or delete
-
-            for element in action:
-                elem_type = element.tag  # node, way, or relation
-                elem_data = {
-                    "id": int(element.attrib["id"]),
-                    "version": int(element.attrib["version"]),
-                    "timestamp": element.attrib["timestamp"],
-                    "uid": int(element.attrib.get("uid", 0)),
-                    "user": element.attrib.get("user", ""),
-                    "changeset": int(element.attrib.get("changeset", 0)),
-                    "tags": {},
-                    "lat": None,
-                    "lon": None,
-                    "refs": None,
-                    "members": None,
-                }
-
-                if elem_type == "node":
-                    elem_data["lat"] = float(element.attrib["lat"])
-                    elem_data["lon"] = float(element.attrib["lon"])
-                elif elem_type == "way":
-                    elem_data["refs"] = []
-                    for child in element:
-                        if child.tag == "nd":
-                            elem_data["refs"].append(int(child.attrib["ref"]))
-                        elif child.tag == "tag":
-                            elem_data["tags"][child.attrib["k"]] = child.attrib["v"]
-                elif elem_type == "relation":
-                    elem_data["members"] = []
-                    for child in element:
-                        if child.tag == "member":
-                            elem_data["members"].append(
-                                {
-                                    "type": child.attrib["type"],
-                                    "ref": int(child.attrib["ref"]),
-                                    "role": child.attrib.get("role", ""),
-                                }
-                            )
-                        elif child.tag == "tag":
-                            elem_data["tags"][child.attrib["k"]] = child.attrib["v"]
-
-                # Handle tags for nodes and ways
-                if elem_type in ("node", "way"):
-                    for child in element:
-                        if child.tag == "tag":
-                            elem_data["tags"][child.attrib["k"]] = child.attrib["v"]
-
-                data[op][elem_type].append(elem_data)
-
-        return data
+# ----------------------------------------------------------------------------
+# Reading OSC into a DataFrame
+# ----------------------------------------------------------------------------
 
 
-def download_osc_to_dataframe(spark: SparkSession, publish_date: str):
-    """
-    Download OSC data for a given date and convert to DataFrame.
+def _build_osc_url(sequence_number: int) -> str:
+    s = str(sequence_number).zfill(9)
+    return urljoin(_REPLICATION_BASE, f"{s[:3]}/{s[3:6]}/{s[6:9]}.osc.gz")
 
-    Args:
-        spark: Spark session
-        publish_date: Date string in YYYY-MM-DD format
 
-    Returns:
-        DataFrame with OSC data
-    """
-    seq_num = get_osc_day_sequence_number(publish_date)
-    osc = OSCData(frequency="day", sequence_number=seq_num)
+def _fetch_xml(file_path: str = None, sequence_number: int = None) -> bytes:
+    """Return raw OSC XML bytes from either a local file or the replication server."""
+    if file_path:
+        if file_path.startswith("s3://"):
+            raise NotImplementedError("S3 OSC files not yet implemented")
+        try:
+            with gzip.GzipFile(file_path, "rb") as f:
+                return f.read()
+        except OSError:
+            with open(file_path, "rb") as f:
+                return f.read()
 
-    # Convert to list of records
+    response = requests.get(_build_osc_url(sequence_number))
+    response.raise_for_status()
+    return gzip.decompress(response.content)
+
+
+def _parse_osc(xml_bytes: bytes) -> list:
+    """Flatten OSC XML into a list of records (one row per change)."""
     records = []
-    for op in ["create", "modify", "delete"]:
-        for elem_type in ["node", "way", "relation"]:
-            for elem in osc.data[op][elem_type]:
-                record = {
-                    "id": elem["id"],
-                    "type": elem_type,
-                    "op": op,
-                    "version": elem["version"],
-                    "timestamp": elem["timestamp"],
-                    "uid": elem["uid"],
-                    "user": elem["user"],
-                    "changeset": elem["changeset"],
-                    "tags": elem["tags"],
-                    "lat": elem["lat"],
-                    "lon": elem["lon"],
-                    "refs": elem["refs"],
-                    "members": elem["members"],
-                    "latest_ts": elem["timestamp"],
-                }
-                records.append(record)
+    for action in ElementTree.fromstring(xml_bytes):
+        op = action.tag  # create | modify | delete
+        for element in action:
+            elem_type = element.tag  # node | way | relation
+            tags, refs, members = {}, None, None
+            for child in element:
+                if child.tag == "tag":
+                    tags[child.attrib["k"]] = child.attrib["v"]
+                elif child.tag == "nd":
+                    refs = refs or []
+                    refs.append(int(child.attrib["ref"]))
+                elif child.tag == "member":
+                    members = members or []
+                    members.append({
+                        "type": child.attrib["type"],
+                        "ref": int(child.attrib["ref"]),
+                        "role": child.attrib.get("role", ""),
+                    })
+            ts = element.attrib["timestamp"]
+            records.append({
+                "id": int(element.attrib["id"]),
+                "type": elem_type,
+                "op": op,
+                "version": int(element.attrib["version"]),
+                "timestamp": ts,
+                "uid": int(element.attrib.get("uid", 0)),
+                "user": element.attrib.get("user", ""),
+                "changeset": int(element.attrib.get("changeset", 0)),
+                "tags": tags,
+                "lat": float(element.attrib["lat"]) if elem_type == "node" else None,
+                "lon": float(element.attrib["lon"]) if elem_type == "node" else None,
+                "refs": refs,
+                "members": members,
+                "latest_ts": ts,
+            })
+    return records
 
-    # Create DataFrame
-    schema = T.StructType(
-        [
-            T.StructField("id", T.LongType(), False),
-            T.StructField("type", T.StringType(), False),
-            T.StructField("op", T.StringType(), False),
-            T.StructField("version", T.LongType(), True),
-            T.StructField("timestamp", T.StringType(), True),
-            T.StructField("uid", T.LongType(), True),
-            T.StructField("user", T.StringType(), True),
-            T.StructField("changeset", T.LongType(), True),
-            T.StructField("tags", T.MapType(T.StringType(), T.StringType()), True),
-            T.StructField("lat", T.DoubleType(), True),
-            T.StructField("lon", T.DoubleType(), True),
-            T.StructField("refs", T.ArrayType(T.LongType()), True),
-            T.StructField(
-                "members",
-                T.ArrayType(
-                    T.StructType(
-                        [
-                            T.StructField("type", T.StringType(), True),
-                            T.StructField("ref", T.LongType(), True),
-                            T.StructField("role", T.StringType(), True),
-                        ]
-                    )
-                ),
-                True,
-            ),
-            T.StructField("latest_ts", T.StringType(), True),
-        ]
+
+def _osc_dataframe(spark: SparkSession, *, file_path: str = None, sequence_number: int = None) -> DataFrame:
+    return spark.createDataFrame(
+        _parse_osc(_fetch_xml(file_path=file_path, sequence_number=sequence_number)),
+        OSC_SCHEMA,
     )
 
-    return spark.createDataFrame(records, schema)
+
+def download_osc_to_dataframe(spark: SparkSession, publish_date: str) -> DataFrame:
+    """Download the daily OSC for `publish_date` (YYYY-MM-DD) and return a DataFrame."""
+    return _osc_dataframe(spark, sequence_number=get_osc_day_sequence_number(publish_date))
 
 
-def read_osc_from_parquet(spark: SparkSession, path: str):
-    """
-    Read OSC data from Parquet files.
+def read_osc_from_file(spark: SparkSession, file_path: str) -> DataFrame:
+    """Read a local .osc or .osc.gz (or plain XML) into a DataFrame."""
+    return _osc_dataframe(spark, file_path=file_path)
 
-    Args:
-        spark: Spark session
-        path: Path to OSC Parquet files
 
-    Returns:
-        DataFrame with OSC data
-    """
+def read_osc_from_parquet(spark: SparkSession, path: str) -> DataFrame:
+    """Read OSC data from pre-parsed Parquet files."""
     return spark.read.parquet(path)
-
-
-def read_osc_from_file(spark: SparkSession, file_path: str):
-    """
-    Read OSC data from a .osc.gz file.
-
-    Args:
-        spark: Spark session
-        file_path: Path to .osc.gz file
-
-    Returns:
-        DataFrame with OSC data
-    """
-    osc = OSCData(file_path=file_path)
-
-    # Convert to list of records
-    records = []
-    for op in ["create", "modify", "delete"]:
-        for elem_type in ["node", "way", "relation"]:
-            for elem in osc.data[op][elem_type]:
-                record = {
-                    "id": elem["id"],
-                    "type": elem_type,
-                    "op": op,
-                    "version": elem["version"],
-                    "timestamp": elem["timestamp"],
-                    "uid": elem["uid"],
-                    "user": elem["user"],
-                    "changeset": elem["changeset"],
-                    "tags": elem["tags"],
-                    "lat": elem["lat"],
-                    "lon": elem["lon"],
-                    "refs": elem["refs"],
-                    "members": elem["members"],
-                    "latest_ts": elem["timestamp"],
-                }
-                records.append(record)
-
-    # Create DataFrame with schema
-    schema = T.StructType(
-        [
-            T.StructField("id", T.LongType(), False),
-            T.StructField("type", T.StringType(), False),
-            T.StructField("op", T.StringType(), False),
-            T.StructField("version", T.LongType(), True),
-            T.StructField("timestamp", T.StringType(), True),
-            T.StructField("uid", T.LongType(), True),
-            T.StructField("user", T.StringType(), True),
-            T.StructField("changeset", T.LongType(), True),
-            T.StructField("tags", T.MapType(T.StringType(), T.StringType()), True),
-            T.StructField("lat", T.DoubleType(), True),
-            T.StructField("lon", T.DoubleType(), True),
-            T.StructField("refs", T.ArrayType(T.LongType()), True),
-            T.StructField(
-                "members",
-                T.ArrayType(
-                    T.StructType(
-                        [
-                            T.StructField("type", T.StringType(), True),
-                            T.StructField("ref", T.LongType(), True),
-                            T.StructField("role", T.StringType(), True),
-                        ]
-                    )
-                ),
-                True,
-            ),
-            T.StructField("latest_ts", T.StringType(), True),
-        ]
-    )
-
-    return spark.createDataFrame(records, schema)

@@ -1,99 +1,65 @@
-.PHONY: install install-dev test lint format clean help
+.PHONY: install install-dev sync lock build lint format clean help \
+        test-e2e-nodes test-e2e-ways test-e2e-relations test-e2e-osc \
+        test-e2e-init test-e2e-all
 
-# Default target
 help:
 	@echo "Available targets:"
-	@echo "  install      - Install the package"
-	@echo "  install-dev  - Install with dev dependencies"
-	@echo "  test         - Run basic tests"
-	@echo "  test-all     - Run all tests"
-	@echo "  lint         - Run linting checks"
-	@echo "  format       - Format code"
-	@echo "  clean        - Clean build artifacts"
+	@echo "  install            Install the package"
+	@echo "  install-dev        Install with dev dependencies"
+	@echo "  test-e2e-init      Full init pipeline (nodes+ways+relations) with timing"
+	@echo "  test-e2e-nodes     E2E stage 1: build nodes"
+	@echo "  test-e2e-ways      E2E stage 2: build ways"
+	@echo "  test-e2e-relations E2E stage 3: build relations"
+	@echo "  test-e2e-osc       E2E stage 4: apply OSC update"
+	@echo "  test-e2e-all       Run all E2E stages in order"
+	@echo "  lint               Ruff + mypy"
+	@echo "  format             Black + ruff --fix"
+	@echo "  clean              Remove build artifacts"
 
-# Install the package
 install:
 	uv pip install -e .
 
-# Install with dev dependencies
 install-dev:
 	uv pip install -e ".[dev]"
 
-# Install all dependencies
-install-all:
-	uv pip install -e ".[all]"
+sync:
+	uv sync
 
-# Run basic tests (no Spark required)
-test:
-	uv run pytest tests/test_imports.py -v
+lock:
+	uv lock
 
-# Run Spark tests (requires Spark with network access)
-test-spark:
-	uv run pytest tests/ -v -m spark
+build:
+	uv build
 
-# Run Parquet integration tests
-test-parquet:
-	uv run python tests/test_parquet_runner.py
-
-# E2E tests (run in order, each can be run independently)
+# E2E stages each persist their output to tests/data/output/warehouse and
+# can be run independently after their predecessors.
 test-e2e-nodes:
-	uv run python tests/test_e2e_nodes.py
+	uv run python tests/test_e2e_nodes.py -v -s
 
 test-e2e-ways:
-	uv run python tests/test_e2e_ways.py
+	uv run python tests/test_e2e_ways.py -v -s
 
 test-e2e-relations:
-	uv run python tests/test_e2e_relations.py
+	uv run python tests/test_e2e_relations.py -v -s
 
-test-e2e-all: test-e2e-nodes test-e2e-ways test-e2e-relations
+test-e2e-osc:
+	uv run python tests/test_e2e_osc.py -v -s
 
-# Run all tests
-test-all:
-	uv run pytest tests/ -v
+test-e2e-init:
+	uv run python tests/test_e2e_init.py -v -s
 
-# Run tests excluding Spark
-test-no-spark:
-	uv run pytest tests/ -v -m "not spark"
+test-e2e-all: test-e2e-nodes test-e2e-ways test-e2e-relations test-e2e-osc
 
-# Run tests with coverage
-test-cov:
-	uv run pytest tests/ -v --cov=kryptosm --cov-report=html
-
-# Lint code
 lint:
 	uv run ruff check kryptosm tests
 	uv run mypy kryptosm
 
-# Format code
 format:
 	uv run black kryptosm tests
 	uv run ruff check --fix kryptosm tests
 
-# Clean build artifacts
 clean:
-	rm -rf build/
-	rm -rf dist/
-	rm -rf *.egg-info
-	rm -rf .pytest_cache/
-	rm -rf .coverage
-	rm -rf htmlcov/
-	rm -rf .mypy_cache/
-	rm -rf .ruff_cache/
+	rm -rf build dist *.egg-info .pytest_cache .coverage htmlcov \
+	       .mypy_cache .ruff_cache
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
-
-# Sync dependencies
-sync:
-	uv sync
-
-# Lock dependencies
-lock:
-	uv lock
-
-# Build package
-build:
-	uv build
-
-# Run the CLI with help
-run-help:
-	uv run kryptosm --help

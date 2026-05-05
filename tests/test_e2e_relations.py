@@ -12,21 +12,21 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kryptosm.spark import create_spark_session_for_testing
-from kryptosm.iceberg import table_exists, get_table_count
-from kryptosm.geometry import (
-    relations_need_geometry,
+from kryptosm.geometry.iceberg_prep import prepare_for_iceberg
+from kryptosm.geometry.relations import (
     construct_multipolygon,
     relation_merge_geometry_data,
-    prepare_for_iceberg,
+    relations_need_geometry,
 )
+from kryptosm.iceberg import get_table_count, table_exists
+from kryptosm.spark import create_spark_session_for_testing
 
 
 # Paths
 TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
 OUTPUT_DIR = Path(__file__).parent / "data" / "output"
 WAREHOUSE_DIR = OUTPUT_DIR / "warehouse"
-TABLE_NAME = "hadoop_catalog.test_db.e2e_nodes"  # Same table as nodes and ways
+TABLE_NAME = "hadoop_catalog.test_db.e2e_osm"
 
 
 def test_build_relations():
@@ -43,7 +43,7 @@ def test_build_relations():
 
     # Create Spark session
     print("\n1. Creating Spark session...")
-    spark = create_spark_session_for_testing(str(WAREHOUSE_DIR), use_sedona_jars=True)
+    spark = create_spark_session_for_testing(str(WAREHOUSE_DIR))
     print("   Spark session created")
 
     try:
@@ -113,8 +113,7 @@ def test_build_relations():
         # Prepare for Iceberg
         print("\n8. Preparing relations for Iceberg...")
         prepare_for_iceberg(
-            spark, "relations_with_geom", "relation", "relations_final", partition_number=2
-        )
+            spark, "relations_with_geom", "relation", "relations_final"        )
         final_count = spark.sql("SELECT COUNT(*) as c FROM relations_final").collect()[0]["c"]
         print(f"   Prepared {final_count:,} relations")
 

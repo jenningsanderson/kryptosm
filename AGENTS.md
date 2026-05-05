@@ -1,366 +1,278 @@
-# AGENTS.md - OSM Iceberg Sync
+# AGENTS.md - kryptosm
 
-This file provides guidance for AI agents working on the kryptosm project.
+Guidance for AI agents working on **kryptosm**, the OSM → Iceberg sync utility.
 
-## Project Overview
+## What this project is
 
-**kryptosm** is a standalone utility for processing OpenStreetMap (OSM) data into Apache Iceberg tables. It converts OSM Parquet files into a unified Iceberg table with geometries built using Apache Sedona.
+A tiny utility that turns OpenStreetMap data into a single Apache Iceberg table.
+It runs at scale on Spark + Sedona. The whole point is to **stay simple**.
 
-### Key Features
-- Initial load from OSM Parquet files (nodes, ways, relations)
-- Incremental updates via OSC (OpenStreetMap Change) files
-- Geometry building with Apache Sedona
-- Single Iceberg table partitioned by type
-- Support for Glue and Hadoop catalogs
+- **Initial load** from OSM Parquet (nodes / ways / relations).
+- **Incremental update** from an OSC change file (download from OSM replication
+  or read a local `.osc.gz`).
+- **Geometries** built with Apache Sedona.
+- **One Iceberg table** partitioned by `type`, supporting Glue or Hadoop catalogs.
 
-## Repository Structure
+## Design rules (do not break these)
+
+1. **Always use DataFrames and SQL.** No pandas, no Python UDFs. Business
+   logic - filtering, joins, geometry construction - lives in SQL strings
+   that build temp views.
+2. **Chain views; don't materialize.** Every step in the pipeline is a
+   `createOrReplaceTempView`. The query optimizer plans the whole DAG;
+   Spark materializes only at write/MERGE time. **Never call `.count()` /
+   `.collect()` for progress prints** - those force eager jobs and ruin
+   scaling.
+3. **No backwards compatibility.** When something is wrong or unused, delete
+   it. Don't add deprecation shims.
+4. **Read the SQL.** A reader should be able to scan a function's SQL and
+   understand the transformation without chasing helpers.
+
+## Repository layout
 
 ```
 kryptosm/
-├── pyproject.toml              # UV project configuration
-├── Makefile                    # Task automation
-├── README.md                   # User documentation
-├── UV_INSTALL.md              # UV setup guide
-├── TROUBLESHOOTING.md         # Common issues
-├── STATUS.md                  # Project status
-├── OUTPUT.md                  # Output locations
-├── AGENTS.md                  # This file
+├── pyproject.toml
+├── Makefile
+├── AGENTS.md                    # this file
 │
-├── kryptosm/          # Main package
+├── kryptosm/                    # package
 │   ├── __init__.py
-│   ├── cli.py                 # Command-line interface
-│   ├── main.py                # Orchestration logic
-│   ├── spark.py               # Spark session management
-│   ├── iceberg.py             # Iceberg table operations
-│   ├── geometry.py            # Geometry building functions
-│   └── osc.py                 # OSC file handling
+│   ├── cli.py                   # argparse only - no logic
+│   ├── main.py                  # init + update orchestration
+│   ├── spark.py                 # Spark/Sedona/Iceberg session factory
+│   ├── iceberg.py               # CREATE / MERGE / DELETE helpers
+│   ├── osc.py                   # OSC XML → DataFrame; OSC dedup SQL
+│   └── geometry/                # the SQL pipeline, one stage per file
+│       ├── __init__.py          # empty - import from the submodules directly
+│       ├── nodes.py             # Point per OSM node
+│       ├── ways.py              # LineString / Polygon per OSM way
+│       ├── relations.py         # MultiPolygon / MultiLineString per relation
+│       ├── osc_apply.py         # dirty-set + overlay + delete (incremental)
+│       └── iceberg_prep.py      # geom → WKB+bbox layout for Iceberg write
 │
-└── tests/                     # Test suite
-    ├── test_imports.py        # Import tests (no Spark needed)
-    ├── test_basic.py          # Basic Spark tests
-    ├── test_parquet_integration.py  # Parquet integration tests
-    ├── test_parquet_runner.py       # Standalone Parquet test
-    ├── test_e2e_nodes.py      # E2E Stage 1: Nodes
-    ├── test_e2e_ways.py       # E2E Stage 2: Ways
-    ├── test_e2e_relations.py  # E2E Stage 3: Relations
-    ├── E2E_TESTS.md           # E2E test documentation
+└── tests/
+    ├── test_e2e_nodes.py        # Stage 1: build nodes from Parquet
+    ├── test_e2e_ways.py         # Stage 2: build ways    (depends on 1)
+    ├── test_e2e_relations.py    # Stage 3: build relations (depends on 1-2)
+    ├── test_osc_update.py       # Stage 4: apply OSC      (depends on 1-3)
     └── data/
-        ├── dc.parquet/        # Test data (DC OSM extract)
-        └── output/            # Test output (gitignored)
+        ├── dc.parquet/          # Test input (DC OSM extract)
+        ├── changeset_1.xml      # Test OSC for stage 4
+        └── output/              # Test output (gitignored)
 ```
 
-## Architecture
+## Data flow
 
-### Data Flow
+Each arrow is a `createOrReplaceTempView`. Spark plans the whole DAG and
+only materializes at the final write / MERGE.
 
 ```
-Input Parquet Files
-    ├── type=node/      → build_node_geometry() → nodes with Point geometries
-    ├── type=way/       → build_linestring_for_ways() → ways with LineString/Polygon
-    └── type=relation/  → construct_multipolygon() → relations with MultiPolygon
-                              ↓
-                    prepare_for_iceberg()
-                              ↓
-                    Iceberg Table (partitioned by type)
+Input Parquet
+  ├── type=node/      [nodes.py]
+  │     build_node_geometry                         → nodes_with_geom
+  ├── type=way/       [ways.py]
+  │     build_linestring_for_ways                   → ways_linestrings
+  │     build_ways_geometry_from_linestring         → ways_with_geom
+  └── type=relation/  [relations.py]
+        relations_need_geometry                     → relations_need_geom
+        construct_multipolygon                      → relations_geom
+        relation_merge_geometry_data                → relations_with_geom
+
+  each → prepare_for_iceberg [iceberg_prep.py]
+       → writeTo(table).append()
+
+Iceberg table (partitioned by type)
 ```
 
-### Module Responsibilities
+For incremental updates, the flow adds:
 
-#### `cli.py` - Command-Line Interface
-- Argument parsing and validation
-- No business logic
-- Delegates to `main.py`
+```
+osc_raw → osc_dedup [osc.py] → osc_latest
 
-**Key functions:**
-- `create_parser()` - Creates argument parser
-- `validate_args()` - Validates arguments
-- `parse_args()` - Parse and validate
+  ├── nodes:     direct upserts → build_node_geometry [nodes.py]
+  ├── ways:      all_dirty_ways [osc_apply.py]   (direct + ways with dirty nodes)
+  │              → build_linestring_for_ways
+  │              → build_ways_geometry_from_linestring [ways.py]
+  └── relations: all_dirty_relations [osc_apply.py]   (direct + dirty-way deps)
+                 → relations_need_geometry
+                 → construct_multipolygon
+                 → relation_merge_geometry_data [relations.py]
 
-#### `main.py` - Orchestration
-- High-level workflow coordination
-- `run_init_mode()` - Initial load from Parquet
-- `run_update_mode()` - Incremental updates from OSC
-- `process_nodes_update()` - Node update logic
-- `process_ways_update()` - Way update logic
-- `process_relations_update()` - Relation update logic
+  each → apply_osc_with_geometry [osc_apply.py]   (overlay updates, drop deletes)
+       → prepare_for_iceberg [iceberg_prep.py]
+       → MERGE INTO + delete MERGE [iceberg.py]
+```
 
-#### `spark.py` - Spark Session Management
-- Creates Spark sessions with Sedona and Iceberg
-- Handles JAR downloads and configuration
-- Supports both Glue and Hadoop catalogs
+## Module reference
 
-**Key functions:**
-- `create_spark_session()` - Main session factory
-- `create_spark_session_for_testing()` - Test session factory
-- `get_sedona_jars()` - Downloads Sedona JARs if needed
+### `cli.py`
 
-#### `iceberg.py` - Iceberg Operations
-- Table creation and management
-- MERGE operations for upserts/deletes
-- Table maintenance (optimize, expire snapshots)
+`argparse` setup only. `parse_args()` returns the validated namespace; the CLI
+entry point dispatches to `main.main`.
 
-**Key functions:**
-- `create_iceberg_table()` - Creates OSM table with schema
-- `table_exists()` - Checks if table exists
-- `get_table_count()` - Gets feature counts by type
-- `merge_into_table()` - MERGE for upserts
-- `delete_from_table()` - MERGE for deletes
+### `main.py`
 
-#### `geometry.py` - Geometry Building
-- Core geometry construction logic using Sedona
-- Ported from `omf.utilities.osm_geometry`
+Two functions:
 
-**Node functions:**
-- `build_node_geometry()` - Creates Points from lat/lon
+- `run_init_mode(spark, args)` - Parquet → Iceberg, full table.
+- `run_update_mode(spark, args)` - OSC → Iceberg, MERGE-based incremental.
 
-**Way functions:**
-- `build_linestring_for_ways()` - Builds linestrings from nodes
-- `build_ways_geometry_from_linestring()` - Converts closed ways to polygons
-- `fix_invalid_geometries()` - Fixes invalid geometries
+Both are flat sequences of view-creation calls followed by writes / merges.
+There is exactly one debug helper `_print_counts` that runs a single SQL
+aggregation at the end.
 
-**Relation functions:**
-- `relations_need_geometry()` - Filters relations needing geometry
-- `construct_multipolygon()` - Main entry point for relation geometries
-- `merge_ways_into_multipolygon()` - Merges member ways
-- `aggregate_polygons_for_relation()` - Aggregates with ST_SymDifference
-- `relation_merge_geometry_data()` - Merges relation data with geometries
+### `spark.py`
 
-**Helper functions:**
-- `_get_all_cycles()` - Extracts cycles from linestrings
-- `_merge_lines()` - UDF for merging lines into polygons
+- `create_spark_session(...)` - production session, Glue or Hadoop catalog.
+  Uses cached JARs from `~/.cache/kryptosm/jars/` if present, else lets Spark
+  resolve via Maven.
+- `create_spark_session_for_testing(warehouse_dir)` - local-mode session used
+  by the E2E tests.
 
-**OSC functions:**
-- `all_dirty_ways()` - Identifies ways needing rebuild
-- `all_dirty_relations()` - Identifies relations needing rebuild
-- `apply_osc_with_geometry()` - Applies OSC changes
+### `iceberg.py`
 
-**Output functions:**
-- `prepare_for_iceberg()` - Converts to WKB, adds bbox and type
+Thin SQL wrappers, nothing more:
 
-#### `osc.py` - OSC File Handling
-- Downloads and parses OSC files
-- Converts to Spark DataFrames
+- `table_exists(spark, table_name)` - DESCRIBE / catch.
+- `create_iceberg_table(spark, table_name, table_location=None)` - DROP +
+  CREATE with the canonical schema below.
+- `get_table_count(spark, table_name)` - `{type: count}` summary.
+- `merge_into_table(spark, table_name, source_view, match_condition)` -
+  upsert MERGE.
+- `delete_from_table(spark, table_name, source_view, match_condition)` -
+  delete MERGE.
 
-**Key functions:**
-- `osc_dedup()` - Deduplicates OSC records
-- `OSCData` class - Downloads and parses OSC XML
-- `get_osc_day_sequence_number()` - Calculates sequence from date
-- `download_osc_to_dataframe()` - Downloads and converts to DataFrame
-- `read_osc_from_parquet()` - Reads OSC from Parquet
-- `read_osc_from_file()` - Reads OSC from .osc.gz file
+### `geometry/` (the SQL pipeline)
 
-## Iceberg Table Schema
+Every function in this package takes view names in/out and runs a single
+SQL statement (occasionally two or three when intermediate views are
+clearer). Functions live in the submodule that matches their stage so a
+reader can find them without grepping. Each function's docstring lists
+**input view columns**, **output view columns**, and **why** the SQL is
+shaped the way it is.
+
+Import from the submodule directly - the package `__init__.py` is empty
+on purpose.
+
+- **`geometry/nodes.py`** - `build_node_geometry`. Projects (lat, lon) to
+  ST_Point with 7-digit precision.
+- **`geometry/ways.py`** - `build_linestring_for_ways`,
+  `build_ways_geometry_from_linestring`. Joins ways to their node
+  geometries, sorts by node position, and promotes closed area-tagged
+  ways to polygons.
+- **`geometry/relations.py`** - `relations_need_geometry`,
+  `construct_multipolygon`, `relation_merge_geometry_data`. Polygon types
+  (`multipolygon`, `boundary`) get outer-minus-inner MultiPolygons; line
+  types (`route`, `waterway`) get a unioned MultiLineString. The set of
+  built types lives in `GEOMETRY_RELATION_TYPES`. Other relation types
+  are still written, just with NULL geometry.
+- **`geometry/osc_apply.py`** - `all_dirty_ways`, `all_dirty_relations`,
+  `apply_osc_with_geometry`. Compute the dependency-aware dirty set, then
+  overlay (COALESCE) updates and drop deletes (LEFT ANTI JOIN).
+- **`geometry/iceberg_prep.py`** - `prepare_for_iceberg`,
+  `MAXIMUM_RELATION_GEOMETRY_SIZE`,
+  `HUGE_GEOMETRY_SIMPLIFICATION_FACTOR`. Serializes `geom` to WKB, adds
+  the bbox struct, pins the `type` partition column, and simplifies
+  oversized relation geometries inline.
+
+### `osc.py`
+
+- `OSC_SCHEMA` - the single source of truth for the OSC DataFrame schema.
+- `osc_dedup` - SQL: keep the latest `(id, type)` per OSC.
+- `download_osc_to_dataframe(spark, publish_date)` - download a daily OSC
+  by date and parse to DataFrame.
+- `read_osc_from_file(spark, file_path)` - parse a local `.osc[.gz]`.
+- `read_osc_from_parquet(spark, path)` - read an already-parsed OSC.
+
+XML parsing is pure Python because the input format demands it; the moment
+we have records, we hand them to Spark and never look back.
+
+## Iceberg table schema
 
 ```sql
 CREATE TABLE table_name (
-    id BIGINT,
-    type STRING,                    -- 'node', 'way', 'relation'
-    version BIGINT,
+    id        BIGINT,
+    type      STRING,                 -- 'node' | 'way' | 'relation'
+    version   BIGINT,
     timestamp TIMESTAMP,
     changeset BIGINT,
-    uid BIGINT,
-    user STRING,
-    tags MAP<STRING, STRING>,
-    lat DOUBLE,                     -- nodes only
-    lon DOUBLE,                     -- nodes only
-    refs ARRAY<BIGINT>,             -- ways only
-    members ARRAY<STRUCT<           -- relations only
-        type: STRING,
-        ref: BIGINT,
-        role: STRING
-    >>,
+    uid       BIGINT,
+    user      STRING,
+    tags      MAP<STRING, STRING>,
+    lat       DOUBLE,                 -- nodes
+    lon       DOUBLE,                 -- nodes
+    refs      ARRAY<BIGINT>,          -- ways
+    members   ARRAY<STRUCT<type: STRING, ref: BIGINT, role: STRING>>,  -- relations
     latest_ts TIMESTAMP,
-    geometry BINARY,                -- WKB format
-    bbox STRUCT<                    -- Bounding box
-        xmin: FLOAT,
-        xmax: FLOAT,
-        ymin: FLOAT,
-        ymax: FLOAT
-    >
-) USING iceberg
+    geometry  BINARY,                 -- WKB
+    bbox      STRUCT<xmin: FLOAT, xmax: FLOAT, ymin: FLOAT, ymax: FLOAT>
+)
+USING iceberg
 PARTITIONED BY (type)
 ```
 
-## Testing
+## Tests
 
-### Test Categories
-
-1. **Import Tests** (`test_imports.py`)
-   - No Spark required
-   - Verifies all modules import correctly
-   - Fast (seconds)
-
-2. **Basic Tests** (`test_basic.py`)
-   - Requires Spark
-   - Tests table creation and basic operations
-   - Uses synthetic data
-
-3. **Parquet Integration Tests** (`test_parquet_integration.py`)
-   - Requires Spark
-   - Tests with real DC Parquet data
-   - Tests geometry building
-
-4. **E2E Tests** (3 stages)
-   - `test_e2e_nodes.py` - Stage 1: Build nodes
-   - `test_e2e_ways.py` - Stage 2: Build ways (depends on Stage 1)
-   - `test_e2e_relations.py` - Stage 3: Build relations (depends on Stages 1-2)
-   - Each stage can run independently
-   - Output persists in `tests/data/output/`
-
-### Running Tests
+The tests are E2E-only and chain through the same SQL functions production
+uses. All four stages write to the **same** Iceberg table
+(`hadoop_catalog.test_db.e2e_osm`); each persists its output to
+`tests/data/output/warehouse`, so you can run any stage standalone once
+its predecessors have run.
 
 ```bash
-# Import tests only (always works)
-uv run pytest tests/test_imports.py -v
-
-# Spark tests (requires working Spark)
-uv run pytest tests/test_basic.py -v -m spark
-
-# E2E tests (run in order)
-make test-e2e-nodes
-make test-e2e-ways
-make test-e2e-relations
-
-# Or all at once
-make test-e2e-all
+make test-e2e-nodes      # stage 1
+make test-e2e-ways       # stage 2
+make test-e2e-relations  # stage 3
+make test-e2e-osc        # stage 4 (applies tests/data/changeset_1.xml)
+make test-e2e-all        # all four in order
 ```
 
-## Development Guidelines
+Stage 4 calls `kryptosm.main.run_update_mode` directly so the test path is
+the production path.
 
-### Code Style
-- Follow existing patterns in the codebase
-- Use Black for formatting (line length: 100)
-- Use Ruff for linting
-- Add docstrings for public functions
-- Keep functions focused and modular
+## Common changes
 
-### Adding New Features
+### New geometry rule
 
-1. **New geometry operations**: Add to `geometry.py`
-2. **New Iceberg operations**: Add to `iceberg.py`
-3. **New CLI options**: Add to `cli.py`, handle in `main.py`
-4. **New data sources**: Create new module for additional input formats
+Edit the SQL in the right `geometry/` submodule (`nodes.py`, `ways.py`,
+`relations.py`). There is no other place for it.
 
-### Testing New Features
+### New relation type that needs geometry
 
-1. Add unit tests to `test_basic.py` or create new test file
-2. Mark Spark tests with `@pytest.mark.spark`
-3. Update `tests/README.md` if needed
-4. Ensure import tests still pass
+Add it to `GEOMETRY_RELATION_TYPES` in `geometry/relations.py`, then
+either extend `construct_multipolygon` (if it's a new shape kind) or rely
+on the existing polygon / line branches.
 
-### Documentation
+### Schema change
 
-- Update `README.md` for user-facing changes
-- Update `AGENTS.md` (this file) for architectural changes
-- Add docstrings for new functions
-- Update `STATUS.md` for project status changes
+Edit `create_iceberg_table` in `iceberg.py`, then make sure
+`prepare_for_iceberg` in `geometry/iceberg_prep.py` produces a matching
+shape, and update the schema block in this file. There is no migration
+story - we recreate the table.
 
-## Common Tasks
+### New CLI option
 
-### Adding a New Geometry Function
-
-1. Add function to `geometry.py`:
-```python
-def my_new_geometry_function(spark: SparkSession, input_view: str, result_view: str):
-    """
-    Brief description.
-    
-    Args:
-        spark: Spark session
-        input_view: Input view name
-        result_view: Output view name
-    """
-    spark.sql(f"""
-        SELECT ..., ST_SomeFunction(...) as geom
-        FROM {input_view}
-    """).createOrReplaceTempView(result_view)
-```
-
-2. Add test in `test_basic.py` or `test_parquet_integration.py`
-
-3. Update this AGENTS.md file
-
-### Modifying the Iceberg Schema
-
-1. Update `create_iceberg_table()` in `iceberg.py`
-2. Update `prepare_for_iceberg()` in `geometry.py` if needed
-3. Update schema documentation in README.md and this file
-4. Test with `test_basic.py::test_table_creation`
-
-### Adding CLI Options
-
-1. Add argument in `cli.py` `create_parser()`
-2. Add validation in `cli.py` `validate_args()`
-3. Handle in `main.py` `run_init_mode()` or `run_update_mode()`
-4. Update README.md examples
+Add to `cli.py`'s `create_parser` and `validate_args`, then consume in
+`main.py`.
 
 ## Dependencies
 
-### Core Dependencies
-- `pyspark==3.5.0` - Spark framework
-- `apache-sedona==1.8.1` - Geospatial processing
-- `boto3>=1.35.47` - AWS integration (Glue, S3)
-- `requests>=2.28.0` - HTTP requests (OSC downloads)
+Pinned in `pyproject.toml`:
 
-### Optional Dependencies
-- `pytest>=7.0.0` - Testing
-- `black>=23.0.0` - Code formatting
-- `ruff>=0.1.0` - Linting
-- `mypy>=1.0.0` - Type checking
+- `pyspark==3.5.0`
+- `apache-sedona==1.8.1`
+- `boto3>=1.35.47`
+- `requests>=2.28.0`
 
-### JAR Dependencies (auto-downloaded)
-- `sedona-spark-shaded-3.5_2.12-1.8.1.jar` (80 MB)
-- `iceberg-spark-runtime-3.5_2.12-1.6.1.jar` (40 MB)
-- `iceberg-aws-bundle-1.6.1.jar` (30 MB)
+JARs auto-cached at `~/.cache/kryptosm/jars/`:
 
-JARs are cached at `~/.cache/kryptosm/jars/`
+- `sedona-spark-shaded-3.5_2.12-1.8.1.jar`
+- `iceberg-spark-runtime-3.5_2.12-1.6.1.jar`
+- `iceberg-aws-bundle-1.6.1.jar`
 
-## Performance Considerations
-
-### Geometry Building
-- Nodes: Fast (simple point creation)
-- Ways: Medium (requires node join)
-- Relations: Slow (requires way join and polygon operations)
-
-### Optimization Tips
-- Partition input data by geographic region
-- Increase `partition_number` for large datasets
-- Use `ST_ReducePrecision` to reduce coordinate precision
-- Simplify large relation geometries
-
-### Incremental Updates
-- Only dirty features are rebuilt
-- Nodes: Only new/modified nodes
-- Ways: New/modified ways + ways with dirty nodes
-- Relations: New/modified relations + relations with dirty ways
-
-## Troubleshooting
-
-See `TROUBLESHOOTING.md` for common issues.
-
-### Quick Diagnostics
-
-```bash
-# Check if package imports work
-uv run python tests/test_imports.py
-
-# Check if JARs are downloaded
-ls -lh ~/.cache/kryptosm/jars/
-
-# Check Parquet data
-ls -lh tests/data/dc.parquet/
-
-# Verify installation
-uv run python quickstart.py
-```
-
-## Related Projects
-
-- **omf** - Overture Maps Foundation utilities (source of original code)
-- **Apache Sedona** - Geospatial processing
-- **Apache Iceberg** - Table format
-- **OpenStreetMap** - Data source
+If they aren't cached, Spark resolves them via Maven on session start.
 
 ## License
 
-Apache License 2.0 - Same as parent tf-data-platform repository.
+Apache 2.0.

@@ -11,16 +11,17 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from kryptosm.geometry.iceberg_prep import prepare_for_iceberg
+from kryptosm.geometry.nodes import build_node_geometry
+from kryptosm.iceberg import create_iceberg_table, get_table_count, table_exists
 from kryptosm.spark import create_spark_session_for_testing
-from kryptosm.iceberg import create_iceberg_table, table_exists, get_table_count
-from kryptosm.geometry import build_node_geometry, prepare_for_iceberg
 
 
 # Paths
 TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
 OUTPUT_DIR = Path(__file__).parent / "data" / "output"
 WAREHOUSE_DIR = OUTPUT_DIR / "warehouse"
-TABLE_NAME = "hadoop_catalog.test_db.e2e_nodes"
+TABLE_NAME = "hadoop_catalog.test_db.e2e_osm"
 
 
 def test_build_nodes():
@@ -39,7 +40,7 @@ def test_build_nodes():
 
     # Create Spark session
     print("\n1. Creating Spark session...")
-    spark = create_spark_session_for_testing(str(WAREHOUSE_DIR), use_sedona_jars=True)
+    spark = create_spark_session_for_testing(str(WAREHOUSE_DIR))
     print("   Spark session created")
 
     try:
@@ -64,7 +65,7 @@ def test_build_nodes():
 
         # Prepare for Iceberg
         print("\n5. Preparing for Iceberg...")
-        prepare_for_iceberg(spark, "nodes_with_geom", "node", "nodes_final", partition_number=4)
+        prepare_for_iceberg(spark, "nodes_with_geom", "node", "nodes_final")
         final_count = spark.sql("SELECT COUNT(*) as c FROM nodes_final").collect()[0]["c"]
         print(f"   Prepared {final_count:,} nodes")
 
