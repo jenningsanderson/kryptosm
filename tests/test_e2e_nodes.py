@@ -4,8 +4,8 @@ E2E Test Stage 1: Build Nodes
 Tests building node geometries from Parquet and writing to Iceberg.
 """
 
-import sys
 import os
+import sys
 from pathlib import Path
 
 # Add parent directory to path
@@ -13,9 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kryptosm.geometry.iceberg_prep import prepare_for_iceberg
 from kryptosm.geometry.nodes import build_node_geometry
-from kryptosm.iceberg import create_iceberg_table, get_table_count, table_exists
+from kryptosm.iceberg import create_iceberg_table, get_table_count
 from kryptosm.spark import create_spark_session_for_testing
-
 
 # Paths
 TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
@@ -117,6 +116,7 @@ def test_build_nodes():
 
 if __name__ == "__main__":
     try:
-        test_build_nodes(); sys.exit(0)
+        test_build_nodes()
+        sys.exit(0)
     except Exception:
         sys.exit(1)

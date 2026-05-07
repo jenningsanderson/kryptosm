@@ -78,7 +78,9 @@ def run_init_mode(spark: SparkSession, args):
     spark.read.parquet(f"{args.input_path}/type=node/").createOrReplaceTempView("input_nodes")
     spark.read.parquet(f"{args.input_path}/type=way/").createOrReplaceTempView("input_ways_raw")
     flatten_way_refs(spark, "input_ways_raw", "input_ways")
-    spark.read.parquet(f"{args.input_path}/type=relation/").createOrReplaceTempView("input_relations")
+    spark.read.parquet(f"{args.input_path}/type=relation/").createOrReplaceTempView(
+        "input_relations"
+    )
 
     # ---- Nodes ----------------------------------------------------------------
     build_node_geometry(spark, "input_nodes", "nodes_with_geom")
@@ -145,14 +147,10 @@ def run_update_mode(spark: SparkSession, args):
     )
     prepare_for_iceberg(spark, "nodes_final_geom", "node", "nodes_iceberg")
     merge_into_table(spark, args.table_name, "nodes_iceberg", "t.id = s.id AND t.type = 'node'")
-    delete_from_table(
-        spark, args.table_name, "osc_node_deletes", "t.id = s.id AND t.type = 'node'"
-    )
+    delete_from_table(spark, args.table_name, "osc_node_deletes", "t.id = s.id AND t.type = 'node'")
 
     # Ways: dirty = direct OSC changes + ways whose nodes moved.
-    all_dirty_ways(
-        spark, "base_ways", "osc_way_upserts", "osc_node_upserts", "dirty_ways"
-    )
+    all_dirty_ways(spark, "base_ways", "osc_way_upserts", "osc_node_upserts", "dirty_ways")
     build_linestring_for_ways(spark, "dirty_ways", "nodes_final_geom", "dirty_ways_lines")
     build_ways_geometry_from_linestring(spark, "dirty_ways_lines", "dirty_ways_geom")
     apply_osc_with_geometry(
@@ -212,6 +210,7 @@ def main(args):
     except Exception as e:
         print(f"Error during execution: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
     finally:
@@ -220,4 +219,5 @@ def main(args):
 
 if __name__ == "__main__":
     from .cli import parse_args
+
     main(parse_args())

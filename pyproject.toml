@@ -25,6 +25,7 @@ dependencies = [
     "apache-sedona==1.8.1",
     "boto3>=1.35.47",
     "requests>=2.28.0",
+    "osmium>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -53,6 +54,7 @@ Repository = "https://github.com/OvertureMaps/tf-data-platform"
 
 [project.scripts]
 kryptosm = "kryptosm.cli:main"
+kryptosm-sync = "kryptosm.sync:main"
 
 [build-system]
 requires = ["hatchling"]

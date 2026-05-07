@@ -12,12 +12,11 @@ Anything else gets a NULL geometry and is still written to the table.
 
 from pyspark.sql import SparkSession
 
-
 # Relation `tags['type']` values for which we build geometry.
-GEOMETRY_RELATION_TYPES = ('multipolygon', 'boundary', 'route', 'waterway')
+GEOMETRY_RELATION_TYPES = ("multipolygon", "boundary", "route", "waterway")
 
-_POLYGON_TYPES = ('multipolygon', 'boundary')
-_LINE_TYPES = ('route', 'waterway')
+_POLYGON_TYPES = ("multipolygon", "boundary")
+_LINE_TYPES = ("route", "waterway")
 
 
 def _quote_csv(values) -> str:

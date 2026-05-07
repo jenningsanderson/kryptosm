@@ -14,38 +14,41 @@ import pyspark.sql.types as T
 import requests
 from pyspark.sql import DataFrame, SparkSession
 
-
 # Reference point for the OSC daily-replication sequence number.
 _REF_DATE = datetime(2024, 3, 23, tzinfo=timezone.utc)
 _REF_SEQ = 4210
 _REPLICATION_BASE = "https://planet.openstreetmap.org/replication/day/"
 
-OSC_SCHEMA = T.StructType([
-    T.StructField("id", T.LongType(), False),
-    T.StructField("type", T.StringType(), False),
-    T.StructField("op", T.StringType(), False),
-    T.StructField("version", T.LongType(), True),
-    T.StructField("timestamp", T.StringType(), True),
-    T.StructField("uid", T.LongType(), True),
-    T.StructField("user", T.StringType(), True),
-    T.StructField("changeset", T.LongType(), True),
-    T.StructField("tags", T.MapType(T.StringType(), T.StringType()), True),
-    T.StructField("lat", T.DoubleType(), True),
-    T.StructField("lon", T.DoubleType(), True),
-    T.StructField("refs", T.ArrayType(T.LongType()), True),
-    T.StructField(
-        "members",
-        T.ArrayType(
-            T.StructType([
-                T.StructField("type", T.StringType(), True),
-                T.StructField("ref", T.LongType(), True),
-                T.StructField("role", T.StringType(), True),
-            ])
+OSC_SCHEMA = T.StructType(
+    [
+        T.StructField("id", T.LongType(), False),
+        T.StructField("type", T.StringType(), False),
+        T.StructField("op", T.StringType(), False),
+        T.StructField("version", T.LongType(), True),
+        T.StructField("timestamp", T.StringType(), True),
+        T.StructField("uid", T.LongType(), True),
+        T.StructField("user", T.StringType(), True),
+        T.StructField("changeset", T.LongType(), True),
+        T.StructField("tags", T.MapType(T.StringType(), T.StringType()), True),
+        T.StructField("lat", T.DoubleType(), True),
+        T.StructField("lon", T.DoubleType(), True),
+        T.StructField("refs", T.ArrayType(T.LongType()), True),
+        T.StructField(
+            "members",
+            T.ArrayType(
+                T.StructType(
+                    [
+                        T.StructField("type", T.StringType(), True),
+                        T.StructField("ref", T.LongType(), True),
+                        T.StructField("role", T.StringType(), True),
+                    ]
+                )
+            ),
+            True,
         ),
-        True,
-    ),
-    T.StructField("latest_ts", T.StringType(), True),
-])
+        T.StructField("latest_ts", T.StringType(), True),
+    ]
+)
 
 
 def osc_dedup(spark: SparkSession, osc_view: str, result_view: str):
@@ -134,32 +137,38 @@ def _parse_osc(xml_bytes: bytes) -> list:
                     refs.append(int(child.attrib["ref"]))
                 elif child.tag == "member":
                     members = members or []
-                    members.append({
-                        "type": child.attrib["type"],
-                        "ref": int(child.attrib["ref"]),
-                        "role": child.attrib.get("role", ""),
-                    })
+                    members.append(
+                        {
+                            "type": child.attrib["type"],
+                            "ref": int(child.attrib["ref"]),
+                            "role": child.attrib.get("role", ""),
+                        }
+                    )
             ts = element.attrib["timestamp"]
-            records.append({
-                "id": int(element.attrib["id"]),
-                "type": elem_type,
-                "op": op,
-                "version": int(element.attrib["version"]),
-                "timestamp": ts,
-                "uid": int(element.attrib.get("uid", 0)),
-                "user": element.attrib.get("user", ""),
-                "changeset": int(element.attrib.get("changeset", 0)),
-                "tags": tags,
-                "lat": float(element.attrib["lat"]) if elem_type == "node" else None,
-                "lon": float(element.attrib["lon"]) if elem_type == "node" else None,
-                "refs": refs,
-                "members": members,
-                "latest_ts": ts,
-            })
+            records.append(
+                {
+                    "id": int(element.attrib["id"]),
+                    "type": elem_type,
+                    "op": op,
+                    "version": int(element.attrib["version"]),
+                    "timestamp": ts,
+                    "uid": int(element.attrib.get("uid", 0)),
+                    "user": element.attrib.get("user", ""),
+                    "changeset": int(element.attrib.get("changeset", 0)),
+                    "tags": tags,
+                    "lat": float(element.attrib["lat"]) if elem_type == "node" else None,
+                    "lon": float(element.attrib["lon"]) if elem_type == "node" else None,
+                    "refs": refs,
+                    "members": members,
+                    "latest_ts": ts,
+                }
+            )
     return records
 
 
-def _osc_dataframe(spark: SparkSession, *, file_path: str = None, sequence_number: int = None) -> DataFrame:
+def _osc_dataframe(
+    spark: SparkSession, *, file_path: str = None, sequence_number: int = None
+) -> DataFrame:
     return spark.createDataFrame(
         _parse_osc(_fetch_xml(file_path=file_path, sequence_number=sequence_number)),
         OSC_SCHEMA,

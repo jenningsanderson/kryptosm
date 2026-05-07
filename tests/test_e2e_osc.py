@@ -102,55 +102,61 @@ def test_osc_update():
         with stage("Apply node updates"):
             build_node_geometry(spark, "osc_node_upserts", "updated_nodes_geom")
             apply_osc_with_geometry(
-                spark, "base_nodes", "updated_nodes_geom",
-                "osc_node_deletes", "nodes_final_geom",
+                spark,
+                "base_nodes",
+                "updated_nodes_geom",
+                "osc_node_deletes",
+                "nodes_final_geom",
             )
             prepare_for_iceberg(spark, "nodes_final_geom", "node", "nodes_iceberg")
-            merge_into_table(
-                spark, TABLE_NAME, "nodes_iceberg", "t.id = s.id AND t.type = 'node'"
-            )
+            merge_into_table(spark, TABLE_NAME, "nodes_iceberg", "t.id = s.id AND t.type = 'node'")
             delete_from_table(
                 spark, TABLE_NAME, "osc_node_deletes", "t.id = s.id AND t.type = 'node'"
             )
 
         with stage("Apply way updates"):
-            all_dirty_ways(
-                spark, "base_ways", "osc_way_upserts", "osc_node_upserts", "dirty_ways"
-            )
+            all_dirty_ways(spark, "base_ways", "osc_way_upserts", "osc_node_upserts", "dirty_ways")
             build_linestring_for_ways(spark, "dirty_ways", "nodes_final_geom", "dirty_ways_lines")
             build_ways_geometry_from_linestring(spark, "dirty_ways_lines", "dirty_ways_geom")
             apply_osc_with_geometry(
-                spark, "base_ways", "dirty_ways_geom",
-                "osc_way_deletes", "ways_final_geom",
+                spark,
+                "base_ways",
+                "dirty_ways_geom",
+                "osc_way_deletes",
+                "ways_final_geom",
             )
             prepare_for_iceberg(spark, "ways_final_geom", "way", "ways_iceberg")
-            merge_into_table(
-                spark, TABLE_NAME, "ways_iceberg", "t.id = s.id AND t.type = 'way'"
-            )
+            merge_into_table(spark, TABLE_NAME, "ways_iceberg", "t.id = s.id AND t.type = 'way'")
             delete_from_table(
                 spark, TABLE_NAME, "osc_way_deletes", "t.id = s.id AND t.type = 'way'"
             )
 
         with stage("Apply relation updates"):
             all_dirty_relations(
-                spark, "base_relations", "osc_relation_upserts",
-                "dirty_ways", "dirty_relations",
+                spark,
+                "base_relations",
+                "osc_relation_upserts",
+                "dirty_ways",
+                "dirty_relations",
             )
             relations_need_geometry(spark, "dirty_relations", "rels_need_geom")
             construct_multipolygon(spark, "rels_need_geom", "ways_final_geom", "rels_geom")
-            relation_merge_geometry_data(
-                spark, "dirty_relations", "rels_geom", "dirty_rels_geom"
-            )
+            relation_merge_geometry_data(spark, "dirty_relations", "rels_geom", "dirty_rels_geom")
             apply_osc_with_geometry(
-                spark, "base_relations", "dirty_rels_geom",
-                "osc_relation_deletes", "relations_final_geom",
+                spark,
+                "base_relations",
+                "dirty_rels_geom",
+                "osc_relation_deletes",
+                "relations_final_geom",
             )
             prepare_for_iceberg(spark, "relations_final_geom", "relation", "relations_iceberg")
             merge_into_table(
                 spark, TABLE_NAME, "relations_iceberg", "t.id = s.id AND t.type = 'relation'"
             )
             delete_from_table(
-                spark, TABLE_NAME, "osc_relation_deletes",
+                spark,
+                TABLE_NAME,
+                "osc_relation_deletes",
                 "t.id = s.id AND t.type = 'relation'",
             )
 

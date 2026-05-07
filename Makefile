@@ -1,11 +1,12 @@
 .PHONY: install install-dev sync lock build lint format clean help \
         test-e2e-nodes test-e2e-ways test-e2e-relations test-e2e-osc \
-        test-e2e-init test-e2e-all
+        test-e2e-init test-e2e test-e2e-all
 
 help:
 	@echo "Available targets:"
 	@echo "  install            Install the package"
 	@echo "  install-dev        Install with dev dependencies"
+	@echo "  test-e2e           Init + OSC apply, single Spark session, timed"
 	@echo "  test-e2e-init      Full init pipeline (nodes+ways+relations) with timing"
 	@echo "  test-e2e-nodes     E2E stage 1: build nodes"
 	@echo "  test-e2e-ways      E2E stage 2: build ways"
@@ -47,6 +48,9 @@ test-e2e-osc:
 
 test-e2e-init:
 	uv run python tests/test_e2e_init.py -v -s
+
+test-e2e:
+	uv run python tests/test_e2e.py -v -s
 
 test-e2e-all: test-e2e-nodes test-e2e-ways test-e2e-relations test-e2e-osc
 

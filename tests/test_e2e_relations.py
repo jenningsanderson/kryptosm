@@ -5,8 +5,8 @@ Tests building relation geometries by reading nodes and ways from Iceberg
 and relations from Parquet.
 """
 
-import sys
 import os
+import sys
 from pathlib import Path
 
 # Add parent directory to path
@@ -20,7 +20,6 @@ from kryptosm.geometry.relations import (
 )
 from kryptosm.iceberg import get_table_count, table_exists
 from kryptosm.spark import create_spark_session_for_testing
-
 
 # Paths
 TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
@@ -112,8 +111,7 @@ def test_build_relations():
 
         # Prepare for Iceberg
         print("\n8. Preparing relations for Iceberg...")
-        prepare_for_iceberg(
-            spark, "relations_with_geom", "relation", "relations_final"        )
+        prepare_for_iceberg(spark, "relations_with_geom", "relation", "relations_final")
         final_count = spark.sql("SELECT COUNT(*) as c FROM relations_final").collect()[0]["c"]
         print(f"   Prepared {final_count:,} relations")
 
@@ -125,7 +123,7 @@ def test_build_relations():
         # Verify
         print("\n10. Verifying...")
         counts = get_table_count(spark, TABLE_NAME)
-        print(f"\n    Final table contents:")
+        print("\n    Final table contents:")
         for osm_type, count in counts.items():
             print(f"      {osm_type}: {count:,} features")
 

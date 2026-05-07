@@ -8,7 +8,6 @@ for parallel write.
 
 from pyspark.sql import SparkSession
 
-
 # Relation WKB above this size gets simplified before write so the BINARY
 # column doesn't blow up. ~30 MB is well below Parquet page-size pain points.
 MAXIMUM_RELATION_GEOMETRY_SIZE = 30_000_000

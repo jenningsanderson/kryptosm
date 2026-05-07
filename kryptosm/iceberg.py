@@ -2,6 +2,7 @@
 Iceberg table operations for the OSM table.
 """
 
+from datetime import datetime
 from typing import Optional
 
 from pyspark.sql import SparkSession
@@ -69,10 +70,14 @@ def create_iceberg_table(
 
 def get_table_count(spark: SparkSession, table_name: str) -> dict:
     """Return {osm_type: count} for the OSM table."""
-    rows = spark.sql(
-        f"SELECT type, COUNT(*) AS count FROM {table_name} GROUP BY type"
-    ).collect()
+    rows = spark.sql(f"SELECT type, COUNT(*) AS count FROM {table_name} GROUP BY type").collect()
     return {row["type"]: row["count"] for row in rows}
+
+
+def get_table_max_timestamp(spark: SparkSession, table_name: str) -> Optional[datetime]:
+    """Return the newest ``timestamp`` in the table, or ``None`` if empty."""
+    row = spark.sql(f"SELECT MAX(timestamp) AS max_ts FROM {table_name}").collect()[0]
+    return row["max_ts"]
 
 
 def merge_into_table(

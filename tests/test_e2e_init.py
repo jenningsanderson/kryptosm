@@ -70,16 +70,16 @@ def test_init():
             create_iceberg_table(spark, TABLE_NAME)
 
         with stage("Register input Parquet views"):
-            spark.read.parquet(
-                str(TEST_PARQUET_PATH / "type=node")
-            ).createOrReplaceTempView("input_nodes")
-            spark.read.parquet(
-                str(TEST_PARQUET_PATH / "type=way")
-            ).createOrReplaceTempView("input_ways_raw")
+            spark.read.parquet(str(TEST_PARQUET_PATH / "type=node")).createOrReplaceTempView(
+                "input_nodes"
+            )
+            spark.read.parquet(str(TEST_PARQUET_PATH / "type=way")).createOrReplaceTempView(
+                "input_ways_raw"
+            )
             flatten_way_refs(spark, "input_ways_raw", "input_ways")
-            spark.read.parquet(
-                str(TEST_PARQUET_PATH / "type=relation")
-            ).createOrReplaceTempView("input_relations")
+            spark.read.parquet(str(TEST_PARQUET_PATH / "type=relation")).createOrReplaceTempView(
+                "input_relations"
+            )
 
         with stage("Build + write nodes"):
             build_node_geometry(spark, "input_nodes", "nodes_with_geom")
@@ -103,9 +103,7 @@ def test_init():
                 spark, "input_relations", "relations_geom", "relations_with_geom"
             )
             prepare_for_iceberg(spark, "relations_with_geom", "relation", "relations_final")
-            spark.sql(
-                "SELECT * FROM relations_final"
-            ).writeTo(TABLE_NAME).using("iceberg").append()
+            spark.sql("SELECT * FROM relations_final").writeTo(TABLE_NAME).using("iceberg").append()
 
         with stage("Final count summary"):
             counts = get_table_count(spark, TABLE_NAME)
@@ -118,8 +116,8 @@ def test_init():
         print(f"  {'total':9}: {sum(counts.values()):>14,}")
         print("=" * 70)
 
-        assert counts.get("node", 0) > 0,     "expected nodes in table"
-        assert counts.get("way", 0) > 0,      "expected ways in table"
+        assert counts.get("node", 0) > 0, "expected nodes in table"
+        assert counts.get("way", 0) > 0, "expected ways in table"
         assert counts.get("relation", 0) > 0, "expected relations in table"
     finally:
         spark.stop()

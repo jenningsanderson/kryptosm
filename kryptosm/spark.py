@@ -56,19 +56,23 @@ def create_spark_session(
 
     if catalog_type == "glue":
         builder = (
-            builder
-            .config(f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkCatalog")
-            .config(f"spark.sql.catalog.{catalog_name}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
-            .config(f"spark.sql.catalog.{catalog_name}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+            builder.config(
+                f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkCatalog"
+            )
+            .config(
+                f"spark.sql.catalog.{catalog_name}.catalog-impl",
+                "org.apache.iceberg.aws.glue.GlueCatalog",
+            )
+            .config(
+                f"spark.sql.catalog.{catalog_name}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO"
+            )
         )
         if table_location:
             builder = builder.config(f"spark.sql.catalog.{catalog_name}.warehouse", table_location)
     else:
-        builder = (
-            builder
-            .config("spark.sql.catalog.hadoop_catalog", "org.apache.iceberg.spark.SparkCatalog")
-            .config("spark.sql.catalog.hadoop_catalog.type", "hadoop")
-        )
+        builder = builder.config(
+            "spark.sql.catalog.hadoop_catalog", "org.apache.iceberg.spark.SparkCatalog"
+        ).config("spark.sql.catalog.hadoop_catalog.type", "hadoop")
         if warehouse:
             builder = builder.config("spark.sql.catalog.hadoop_catalog.warehouse", warehouse)
 

@@ -7,14 +7,31 @@ tags become polygons; everything else stays a linestring.
 
 from pyspark.sql import SparkSession
 
-
 # Tag keys that, on a closed way, mark it as an area (polygon).
 # Source: https://wiki.openstreetmap.org/wiki/Key:area
 _AREA_TAG_KEYS = (
-    'aeroway', 'amenity', 'building', 'building:part', 'golf', 'harbour',
-    'historic', 'landuse', 'man_made', 'military', 'natural', 'office',
-    'place', 'power', 'public_transport', 'shop', 'sport', 'tourism',
-    'water', 'waterway', 'wetland', 'area',
+    "aeroway",
+    "amenity",
+    "building",
+    "building:part",
+    "golf",
+    "harbour",
+    "historic",
+    "landuse",
+    "man_made",
+    "military",
+    "natural",
+    "office",
+    "place",
+    "power",
+    "public_transport",
+    "shop",
+    "sport",
+    "tourism",
+    "water",
+    "waterway",
+    "wetland",
+    "area",
 )
 
 
