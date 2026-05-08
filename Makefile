@@ -1,6 +1,6 @@
 .PHONY: install install-dev sync lock build lint format clean help \
         test-e2e-nodes test-e2e-ways test-e2e-relations test-e2e-osc \
-        test-e2e-init test-e2e test-e2e-all
+        test-e2e-init test-e2e test-e2e-all test-e2e-sync test-replication
 
 help:
 	@echo "Available targets:"
@@ -12,7 +12,9 @@ help:
 	@echo "  test-e2e-ways      E2E stage 2: build ways"
 	@echo "  test-e2e-relations E2E stage 3: build relations"
 	@echo "  test-e2e-osc       E2E stage 4: apply OSC update"
+	@echo "  test-e2e-sync      E2E: fetch pending OSC files from Geofabrik"
 	@echo "  test-e2e-all       Run all E2E stages in order"
+	@echo "  test-replication   Replication unit + live tests"
 	@echo "  lint               Ruff + mypy"
 	@echo "  format             Black + ruff --fix"
 	@echo "  clean              Remove build artifacts"
@@ -45,6 +47,12 @@ test-e2e-relations:
 
 test-e2e-osc:
 	uv run python tests/test_e2e_osc.py -v -s
+
+test-e2e-sync:
+	uv run pytest tests/test_e2e_sync.py -m integration -v -s
+
+test-replication:
+	uv run pytest tests/test_replication.py -v
 
 test-e2e-init:
 	uv run python tests/test_e2e_init.py -v -s

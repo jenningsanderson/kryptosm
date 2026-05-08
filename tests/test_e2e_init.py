@@ -39,9 +39,9 @@ from kryptosm.iceberg import create_iceberg_table, get_table_count
 from kryptosm.main import load_with_geom
 from kryptosm.spark import create_spark_session_for_testing
 
-TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
+TEST_PARQUET_PATH = Path(__file__).parent / "data" / "WashingtonDC" / "dc.parquet"
 WAREHOUSE_DIR = Path(__file__).parent / "data" / "output" / "warehouse"
-TABLE_NAME = "hadoop_catalog.test_db.e2e_osm"
+TABLE_NAME = "hadoop_catalog.test_db.dc"
 
 
 @contextmanager

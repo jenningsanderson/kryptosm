@@ -46,10 +46,10 @@ from kryptosm.main import load_with_geom
 from kryptosm.osc import osc_dedup, read_osc_from_file
 from kryptosm.spark import create_spark_session_for_testing
 
-TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
-OSC_FILE = Path(__file__).parent / "data" / "changeset_1.xml"
+TEST_PARQUET_PATH = Path(__file__).parent / "data" / "WashingtonDC" / "dc.parquet"
+OSC_FILE = Path(__file__).parent / "data" / "WashingtonDC" / "osc" / "changeset_1.xml"
 WAREHOUSE_DIR = Path(__file__).parent / "data" / "output" / "warehouse"
-TABLE_NAME = "hadoop_catalog.test_db.e2e_osm"
+TABLE_NAME = "hadoop_catalog.test_db.dc"
 
 
 @contextmanager

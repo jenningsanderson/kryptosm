@@ -7,7 +7,9 @@ DataFrame and downstream logic stays in SQL.
 
 import gzip
 from datetime import datetime, timezone
+from functools import reduce
 from posixpath import join as urljoin
+from typing import List
 from xml.etree import ElementTree
 
 import pyspark.sql.types as T
@@ -183,6 +185,12 @@ def download_osc_to_dataframe(spark: SparkSession, publish_date: str) -> DataFra
 def read_osc_from_file(spark: SparkSession, file_path: str) -> DataFrame:
     """Read a local .osc or .osc.gz (or plain XML) into a DataFrame."""
     return _osc_dataframe(spark, file_path=file_path)
+
+
+def read_osc_files(spark: SparkSession, file_paths: List[str]) -> DataFrame:
+    """Read multiple OSC files and union them into a single DataFrame."""
+    dfs = [_osc_dataframe(spark, file_path=p) for p in file_paths]
+    return reduce(DataFrame.unionAll, dfs)
 
 
 def read_osc_from_parquet(spark: SparkSession, path: str) -> DataFrame:

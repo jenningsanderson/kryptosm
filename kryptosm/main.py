@@ -6,6 +6,8 @@ plans the whole DAG and Spark materializes only at write/MERGE time.
 """
 
 import sys
+from datetime import datetime, timezone
+from typing import List, Optional
 
 from pyspark.sql import SparkSession
 
@@ -30,15 +32,18 @@ from .iceberg import (
     create_iceberg_table,
     delete_from_table,
     get_table_count,
+    get_table_max_timestamp,
     merge_into_table,
     table_exists,
 )
 from .osc import (
     download_osc_to_dataframe,
     osc_dedup,
+    read_osc_files,
     read_osc_from_file,
     read_osc_from_parquet,
 )
+from .replication import DC_REPLICATION_URL, sync
 from .spark import create_spark_session
 
 
@@ -58,6 +63,40 @@ def load_with_geom(spark: SparkSession, table_name: str, osm_type: str, view_nam
         FROM {table_name}
         WHERE type = '{osm_type}'
     """).createOrReplaceTempView(view_name)
+
+
+# ============================================================================
+# OSC replication: fetch pending change files
+# ============================================================================
+
+
+def fetch_pending_osc_files(
+    spark: SparkSession,
+    table_name: str,
+    download_dir: str,
+    base_url: str = DC_REPLICATION_URL,
+    target_date: Optional[datetime] = None,
+) -> List[str]:
+    """Read the table's latest timestamp and download any pending OSC files.
+
+    Intended to be called from within an existing Spark job so everything
+    shares a single session.  Already-downloaded files are skipped.
+
+    Returns a list of local ``.osc.gz`` paths in sequence order, ready to
+    be fed to ``run_update_mode`` one at a time via ``--osc-path``.
+    """
+    ts = get_table_max_timestamp(spark, table_name)
+    if ts is None:
+        raise ValueError(f"Table {table_name} is empty — run init mode first.")
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+
+    return sync(
+        table_timestamp=ts,
+        download_dir=download_dir,
+        base_url=base_url,
+        target_date=target_date,
+    )
 
 
 # ============================================================================
@@ -108,28 +147,21 @@ def run_init_mode(spark: SparkSession, args):
 
 
 # ============================================================================
-# Update mode: apply an OSC change file to the existing table
+# Update mode: apply OSC changes to the existing table
 # ============================================================================
 
 
-def run_update_mode(spark: SparkSession, args):
-    """Apply an OSC change file. Each step is SQL; Spark plans + executes the DAG."""
-    if not table_exists(spark, args.table_name):
-        raise ValueError(f"Table {args.table_name} does not exist. Run init mode first.")
+def _apply_osc(spark: SparkSession, table_name: str):
+    """Core OSC apply logic.
 
-    # Load OSC into a Spark view.
-    if args.download_osc:
-        osc_df = download_osc_to_dataframe(spark, args.osc_date)
-    elif args.osc_path.endswith((".osc.gz", ".osc", ".xml")):
-        osc_df = read_osc_from_file(spark, args.osc_path)
-    else:
-        osc_df = read_osc_from_parquet(spark, args.osc_path)
-    osc_df.createOrReplaceTempView("osc_raw")
+    Assumes ``osc_raw`` view is already registered.  Deduplicates, builds
+    dirty-set geometry, and MERGEs/DELETEs into *table_name*.
+    """
     osc_dedup(spark, "osc_raw", "osc_latest")
 
     # Per-type base / upsert / delete views.
     for osm_type in ("node", "way", "relation"):
-        load_with_geom(spark, args.table_name, osm_type, f"base_{osm_type}s")
+        load_with_geom(spark, table_name, osm_type, f"base_{osm_type}s")
 
         spark.sql(f"""
             SELECT * FROM osc_latest
@@ -146,8 +178,8 @@ def run_update_mode(spark: SparkSession, args):
         spark, "base_nodes", "updated_nodes_geom", "osc_node_deletes", "nodes_final_geom"
     )
     prepare_for_iceberg(spark, "nodes_final_geom", "node", "nodes_iceberg")
-    merge_into_table(spark, args.table_name, "nodes_iceberg", "t.id = s.id AND t.type = 'node'")
-    delete_from_table(spark, args.table_name, "osc_node_deletes", "t.id = s.id AND t.type = 'node'")
+    merge_into_table(spark, table_name, "nodes_iceberg", "t.id = s.id AND t.type = 'node'")
+    delete_from_table(spark, table_name, "osc_node_deletes", "t.id = s.id AND t.type = 'node'")
 
     # Ways: dirty = direct OSC changes + ways whose nodes moved.
     all_dirty_ways(spark, "base_ways", "osc_way_upserts", "osc_node_upserts", "dirty_ways")
@@ -157,8 +189,8 @@ def run_update_mode(spark: SparkSession, args):
         spark, "base_ways", "dirty_ways_geom", "osc_way_deletes", "ways_final_geom"
     )
     prepare_for_iceberg(spark, "ways_final_geom", "way", "ways_iceberg")
-    merge_into_table(spark, args.table_name, "ways_iceberg", "t.id = s.id AND t.type = 'way'")
-    delete_from_table(spark, args.table_name, "osc_way_deletes", "t.id = s.id AND t.type = 'way'")
+    merge_into_table(spark, table_name, "ways_iceberg", "t.id = s.id AND t.type = 'way'")
+    delete_from_table(spark, table_name, "osc_way_deletes", "t.id = s.id AND t.type = 'way'")
 
     # Relations: dirty = direct OSC changes + relations whose member ways are dirty.
     all_dirty_relations(
@@ -172,13 +204,44 @@ def run_update_mode(spark: SparkSession, args):
     )
     prepare_for_iceberg(spark, "relations_final_geom", "relation", "relations_iceberg")
     merge_into_table(
-        spark, args.table_name, "relations_iceberg", "t.id = s.id AND t.type = 'relation'"
+        spark, table_name, "relations_iceberg", "t.id = s.id AND t.type = 'relation'"
     )
     delete_from_table(
-        spark, args.table_name, "osc_relation_deletes", "t.id = s.id AND t.type = 'relation'"
+        spark, table_name, "osc_relation_deletes", "t.id = s.id AND t.type = 'relation'"
     )
 
-    _print_counts(spark, args.table_name)
+    _print_counts(spark, table_name)
+
+
+def apply_osc_files(
+    spark: SparkSession,
+    table_name: str,
+    osc_paths: List[str],
+) -> None:
+    """Read multiple ``.osc.gz`` files, union + dedup them, and apply to *table_name*.
+
+    This is the programmatic entry point for applying downloaded OSC files
+    (e.g. the output of :func:`fetch_pending_osc_files`).
+    """
+    if not table_exists(spark, table_name):
+        raise ValueError(f"Table {table_name} does not exist. Run init mode first.")
+    read_osc_files(spark, osc_paths).createOrReplaceTempView("osc_raw")
+    _apply_osc(spark, table_name)
+
+
+def run_update_mode(spark: SparkSession, args):
+    """Apply OSC changes via CLI args. Each step is SQL; Spark plans + executes the DAG."""
+    if not table_exists(spark, args.table_name):
+        raise ValueError(f"Table {args.table_name} does not exist. Run init mode first.")
+
+    if args.download_osc:
+        osc_df = download_osc_to_dataframe(spark, args.osc_date)
+    elif args.osc_path.endswith((".osc.gz", ".osc", ".xml")):
+        osc_df = read_osc_from_file(spark, args.osc_path)
+    else:
+        osc_df = read_osc_from_parquet(spark, args.osc_path)
+    osc_df.createOrReplaceTempView("osc_raw")
+    _apply_osc(spark, args.table_name)
 
 
 def _print_counts(spark: SparkSession, table_name: str):

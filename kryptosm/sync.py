@@ -37,11 +37,11 @@ from datetime import datetime, timezone
 from osmium.replication.server import ReplicationServer
 
 from .iceberg import get_table_max_timestamp, table_exists
+from .main import fetch_pending_osc_files
 from .replication import (
     DC_REPLICATION_URL,
     pending_sequences,
     resolve_target_sequence,
-    sync,
 )
 from .spark import create_spark_session
 
@@ -106,33 +106,38 @@ def _parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def _read_table_timestamp(args) -> datetime:
-    """Spin up a minimal Spark session, read MAX(timestamp), shut down."""
-    spark = create_spark_session(
+def _create_spark(args):
+    return create_spark_session(
         app_name="kryptosm-sync",
         master=args.spark_master,
         catalog_type=args.catalog_type,
         catalog_name=args.catalog_name,
         warehouse=args.catalog_warehouse,
     )
-    try:
-        if not table_exists(spark, args.table_name):
-            print(f"Error: table {args.table_name} does not exist.", file=sys.stderr)
-            sys.exit(1)
-        ts = get_table_max_timestamp(spark, args.table_name)
-        if ts is None:
-            print("Error: table is empty (no rows).", file=sys.stderr)
-            sys.exit(1)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return ts
-    finally:
-        spark.stop()
+
+
+def _read_table_timestamp(spark, table_name: str) -> datetime:
+    """Read MAX(timestamp) from the table, or exit on error."""
+    if not table_exists(spark, table_name):
+        print(f"Error: table {table_name} does not exist.", file=sys.stderr)
+        sys.exit(1)
+    ts = get_table_max_timestamp(spark, table_name)
+    if ts is None:
+        print("Error: table is empty (no rows).", file=sys.stderr)
+        sys.exit(1)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
 
 
 def cmd_status(args):
     base_url = args.replication_url
-    table_ts = _read_table_timestamp(args)
+
+    spark = _create_spark(args)
+    try:
+        table_ts = _read_table_timestamp(spark, args.table_name)
+    finally:
+        spark.stop()
 
     with ReplicationServer(base_url) as server:
         remote = server.get_state_info()
@@ -163,34 +168,22 @@ def cmd_sync(args):
     if args.target_date:
         target_date = datetime.strptime(args.target_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
-    table_ts = _read_table_timestamp(args)
+    spark = _create_spark(args)
+    try:
+        paths = fetch_pending_osc_files(
+            spark,
+            args.table_name,
+            args.download_dir,
+            base_url=base_url,
+            target_date=target_date,
+        )
+    finally:
+        spark.stop()
 
-    with ReplicationServer(base_url) as server:
-        remote = server.get_state_info()
-        if remote is None:
-            print("Error: could not reach replication server.", file=sys.stderr)
-            sys.exit(1)
-
-        table_seq = server.timestamp_to_sequence(table_ts)
-        if table_seq is None:
-            print("Error: could not map table timestamp to a sequence.", file=sys.stderr)
-            sys.exit(1)
-
-        target_seq = resolve_target_sequence(server, remote.sequence, target_date)
-
-    seqs = pending_sequences(table_seq, target_seq)
-    if not seqs:
+    if not paths:
         print("Already up to date.")
         return
 
-    print(f"Table at sequence {table_seq} ({table_ts.isoformat()})")
-    print(f"Downloading {len(seqs)} file(s): {seqs[0]} .. {seqs[-1]}")
-    paths = sync(
-        table_timestamp=table_ts,
-        download_dir=args.download_dir,
-        base_url=base_url,
-        target_date=target_date,
-    )
     print(f"Done. {len(paths)} file(s) saved to {args.download_dir}/")
 
 

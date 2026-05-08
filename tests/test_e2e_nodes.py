@@ -17,10 +17,10 @@ from kryptosm.iceberg import create_iceberg_table, get_table_count
 from kryptosm.spark import create_spark_session_for_testing
 
 # Paths
-TEST_PARQUET_PATH = Path(__file__).parent / "data" / "dc.parquet"
+TEST_PARQUET_PATH = Path(__file__).parent / "data" / "WashingtonDC" / "dc.parquet"
 OUTPUT_DIR = Path(__file__).parent / "data" / "output"
 WAREHOUSE_DIR = OUTPUT_DIR / "warehouse"
-TABLE_NAME = "hadoop_catalog.test_db.e2e_osm"
+TABLE_NAME = "hadoop_catalog.test_db.dc"
 
 
 def test_build_nodes():
