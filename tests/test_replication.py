@@ -1,5 +1,5 @@
 """
-Tests for the replication sync utility.
+Tests for the replication download utility.
 
 The ``test_pending_*`` tests are pure-offline.  The ``test_live_*``
 tests hit the Geofabrik DC replication server and are marked with
@@ -15,7 +15,7 @@ from kryptosm.replication import (
     DC_REPLICATION_URL,
     download_osc_file,
     pending_sequences,
-    sync,
+    fetch_osc_files,
 )
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ def test_live_download_idempotent(tmp_path):
 
 @pytest.mark.integration
 def test_live_sync_one_file(tmp_path):
-    """Use a timestamp matching head-1 so sync downloads the remaining files."""
+    """Use a timestamp matching head-1 so fetch downloads the remaining files."""
     dl_dir = str(tmp_path / "osc")
 
     with ReplicationServer(DC_REPLICATION_URL) as server:
@@ -108,7 +108,7 @@ def test_live_sync_one_file(tmp_path):
         prev = server.get_state_info(latest.sequence - 1)
         assert prev is not None
 
-    paths = sync(
+    paths = fetch_osc_files(
         table_timestamp=prev.timestamp,
         download_dir=dl_dir,
         base_url=DC_REPLICATION_URL,
@@ -127,7 +127,7 @@ def test_live_sync_already_current(tmp_path):
         latest = server.get_state_info()
         assert latest is not None
 
-    paths = sync(
+    paths = fetch_osc_files(
         table_timestamp=latest.timestamp,
         download_dir=dl_dir,
         base_url=DC_REPLICATION_URL,

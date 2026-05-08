@@ -1,10 +1,10 @@
 """
-Geofabrik OSC replication sync.
+Geofabrik OSC replication downloads.
 
-Runs on top of ``pyosmium``'s :class:`ReplicationServer`.  Given the
-newest timestamp already in the Iceberg table, this module figures out
-which Geofabrik sequence that corresponds to, what's available on the
-server, and downloads the gap.
+Runs on top of ``pyosmium``'s :class:`ReplicationServer`.  Given either
+a last-applied sequence number or the newest timestamp in the Iceberg
+table, this module figures out what's available on the server and
+downloads the gap.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def resolve_target_sequence(
     remote_seq: int,
     target_date: Optional[datetime] = None,
 ) -> int:
-    """Decide which sequence number to sync up to."""
+    """Decide which sequence number to fetch up to."""
     if target_date is None:
         return remote_seq
     remote_state = server.get_state_info(remote_seq)
@@ -66,31 +66,39 @@ def download_osc_file(server: ReplicationServer, seq: int, download_dir: str) ->
 
 
 # ---------------------------------------------------------------------------
-# High-level sync
+# High-level fetch
 # ---------------------------------------------------------------------------
 
 
-def sync(
-    table_timestamp: datetime,
+def fetch_osc_files(
     download_dir: str,
     base_url: str = DC_REPLICATION_URL,
+    last_applied_sequence: Optional[int] = None,
+    table_timestamp: Optional[datetime] = None,
     target_date: Optional[datetime] = None,
 ) -> List[str]:
-    """Download all pending OSC files between *table_timestamp* and the
-    target (default: remote head).
+    """Download all pending OSC files and return their local paths.
 
-    Returns a list of local file paths in sequence order.
+    Supply *last_applied_sequence* when the table has a stored sequence
+    property (fast, exact).  Falls back to *table_timestamp* which uses
+    ``timestamp_to_sequence`` (slower, may re-download the last file).
     """
+    if last_applied_sequence is None and table_timestamp is None:
+        raise ValueError("Provide either last_applied_sequence or table_timestamp")
+
     with ReplicationServer(base_url) as server:
         remote_state = server.get_state_info()
         if remote_state is None:
             raise RuntimeError(f"Could not fetch remote state from {base_url}")
 
-        start_seq = server.timestamp_to_sequence(table_timestamp)
-        if start_seq is None:
-            raise RuntimeError(
-                f"Could not map table timestamp {table_timestamp} to a sequence number"
-            )
+        if last_applied_sequence is not None:
+            start_seq = last_applied_sequence
+        else:
+            start_seq = server.timestamp_to_sequence(table_timestamp)
+            if start_seq is None:
+                raise RuntimeError(
+                    f"Could not map table timestamp {table_timestamp} to a sequence number"
+                )
 
         target_seq = resolve_target_sequence(server, remote_state.sequence, target_date)
         seqs = pending_sequences(start_seq, target_seq)

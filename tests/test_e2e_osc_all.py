@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Apply the next pending OSC file. Idempotent — run repeatedly and each
-invocation fetches and applies exactly one file.
+Apply ALL pending OSC files, one at a time, until the table is current.
 
 Set KRYPTOSM_REGION=oregon to use Oregon data (default: dc).
 """
@@ -21,12 +20,12 @@ from tests import (
 
 
 @pytest.mark.integration
-def test_apply_next_osc():
+def test_apply_all_pending():
     configure_logging()
     region = get_region()
 
     print(f"\n{'=' * 70}")
-    print(f"APPLY NEXT OSC — {region.db_name}")
+    print(f"APPLY ALL PENDING OSC FILES — {region.db_name}")
     print(f"{'=' * 70}")
     print(f"Table: {region.table_name}\n")
 
@@ -42,26 +41,31 @@ def test_apply_next_osc():
             seq_before = get_last_applied_sequence(spark, region.table_name)
             print(f"  sequence: {seq_before}")
 
-        with stage("Fetch next OSC"):
+        applied = 0
+        while True:
             osc_path = next_osc_path(
                 spark, region.table_name, str(region.osc_dir),
                 base_url=region.replication_url,
             )
+            if osc_path is None:
+                break
 
-        if osc_path is None:
+            label = os.path.basename(osc_path)
+            with stage(f"Apply {label} (#{applied + 1})"):
+                apply_osc(spark, region.table_name, osc_path,
+                          region.node_to_ways, region.way_to_relations)
+            applied += 1
+
+        if applied == 0:
             print("Already current — nothing to apply.")
             return
-
-        print(f"  {os.path.basename(osc_path)}  ({os.path.getsize(osc_path):,} bytes)")
-
-        with stage(f"Apply {os.path.basename(osc_path)}"):
-            apply_osc(spark, region.table_name, osc_path,
-                      region.node_to_ways, region.way_to_relations)
 
         with stage("Counts AFTER"):
             after = get_table_count(spark, region.table_name)
             seq_after = get_last_applied_sequence(spark, region.table_name)
 
+        print("=" * 70)
+        print(f"Applied {applied} OSC file(s)")
         print("=" * 70)
         for osm_type in ("node", "way", "relation"):
             b = before.get(osm_type, 0)
@@ -77,4 +81,4 @@ def test_apply_next_osc():
 
 
 if __name__ == "__main__":
-    test_apply_next_osc()
+    test_apply_all_pending()

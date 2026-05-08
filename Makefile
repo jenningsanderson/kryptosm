@@ -1,29 +1,17 @@
-.PHONY: install install-dev sync lock build lint format clean help \
-        test-e2e-nodes test-e2e-ways test-e2e-relations test-e2e-osc \
-        test-e2e-init test-e2e test-e2e-all test-e2e-sync test-replication
+.PHONY: sync lock build lint format clean help \
+        test-e2e-init test-e2e-osc test-e2e-osc-all \
+        test-replication test-inspect
 
 help:
 	@echo "Available targets:"
-	@echo "  install            Install the package"
-	@echo "  install-dev        Install with dev dependencies"
-	@echo "  test-e2e           Init + OSC apply, single Spark session, timed"
-	@echo "  test-e2e-init      Full init pipeline (nodes+ways+relations) with timing"
-	@echo "  test-e2e-nodes     E2E stage 1: build nodes"
-	@echo "  test-e2e-ways      E2E stage 2: build ways"
-	@echo "  test-e2e-relations E2E stage 3: build relations"
-	@echo "  test-e2e-osc       E2E stage 4: apply OSC update"
-	@echo "  test-e2e-sync      E2E: fetch pending OSC files from Geofabrik"
-	@echo "  test-e2e-all       Run all E2E stages in order"
+	@echo "  test-e2e-init      Full init pipeline (nodes+ways+relations)"
+	@echo "  test-e2e-osc       Fetch + apply the next pending OSC (idempotent)"
+	@echo "  test-e2e-osc-all   Fetch + apply ALL pending OSCs until current"
+	@echo "  test-inspect       Snapshot inspector"
 	@echo "  test-replication   Replication unit + live tests"
 	@echo "  lint               Ruff + mypy"
 	@echo "  format             Black + ruff --fix"
 	@echo "  clean              Remove build artifacts"
-
-install:
-	uv pip install -e .
-
-install-dev:
-	uv pip install -e ".[dev]"
 
 sync:
 	uv sync
@@ -34,33 +22,20 @@ lock:
 build:
 	uv build
 
-# E2E stages each persist their output to tests/data/output/warehouse and
-# can be run independently after their predecessors.
-test-e2e-nodes:
-	uv run python tests/test_e2e_nodes.py -v -s
-
-test-e2e-ways:
-	uv run python tests/test_e2e_ways.py -v -s
-
-test-e2e-relations:
-	uv run python tests/test_e2e_relations.py -v -s
+test-e2e-init:
+	uv run python tests/test_e2e_init.py -v -s
 
 test-e2e-osc:
-	uv run python tests/test_e2e_osc.py -v -s
+	uv run pytest tests/test_e2e_osc.py -m integration -v -s
 
-test-e2e-sync:
-	uv run pytest tests/test_e2e_sync.py -m integration -v -s
+test-e2e-osc-all:
+	uv run pytest tests/test_e2e_osc_all.py -m integration -v -s
 
 test-replication:
 	uv run pytest tests/test_replication.py -v
 
-test-e2e-init:
-	uv run python tests/test_e2e_init.py -v -s
-
-test-e2e:
-	uv run python tests/test_e2e.py -v -s
-
-test-e2e-all: test-e2e-nodes test-e2e-ways test-e2e-relations test-e2e-osc
+test-inspect:
+	uv run python tests/test_inspect.py -v -s
 
 lint:
 	uv run ruff check kryptosm tests

@@ -1,6 +1,6 @@
 # AGENTS.md - kryptosm
 
-Guidance for AI agents working on **kryptosm**, the OSM → Iceberg sync utility.
+Guidance for AI agents working on **kryptosm**, the OSM → Iceberg utility.
 
 ## What this project is
 
@@ -37,28 +37,30 @@ kryptosm/
 ├── AGENTS.md                    # this file
 │
 ├── kryptosm/                    # package
-│   ├── __init__.py
-│   ├── cli.py                   # argparse only - no logic
-│   ├── main.py                  # init + update orchestration
-│   ├── spark.py                 # Spark/Sedona/Iceberg session factory
-│   ├── iceberg.py               # CREATE / MERGE / DELETE helpers
-│   ├── osc.py                   # OSC XML → DataFrame; OSC dedup SQL
+│   ├── __init__.py              # public API re-exports
+│   ├── iceberg.py               # CREATE / MERGE / DELETE, index tables, maintenance
+│   ├── osc.py                   # OSC parsing, fetch (next_osc_path), apply (apply_osc)
+│   ├── replication.py           # Geofabrik OSC download via pyosmium
+│   ├── inspect.py               # snapshot diff → GeoJSON + HTML map viewer
 │   └── geometry/                # the SQL pipeline, one stage per file
-│       ├── __init__.py          # empty - import from the submodules directly
+│       ├── __init__.py
 │       ├── nodes.py             # Point per OSM node
 │       ├── ways.py              # LineString / Polygon per OSM way
 │       ├── relations.py         # MultiPolygon / MultiLineString per relation
-│       ├── osc_apply.py         # dirty-set + overlay + delete (incremental)
+│       ├── osc_apply.py         # dirty-set computation using index tables
 │       └── iceberg_prep.py      # geom → WKB+bbox layout for Iceberg write
 │
 └── tests/
-    ├── test_e2e_nodes.py        # Stage 1: build nodes from Parquet
-    ├── test_e2e_ways.py         # Stage 2: build ways    (depends on 1)
-    ├── test_e2e_relations.py    # Stage 3: build relations (depends on 1-2)
-    ├── test_osc_update.py       # Stage 4: apply OSC      (depends on 1-3)
+    ├── __init__.py              # Spark session factory, constants, helpers
+    ├── test_e2e_init.py         # Build table from Parquet
+    ├── test_e2e_osc.py          # Fetch + apply next pending OSC (idempotent)
+    ├── test_e2e_osc_all.py      # Fetch + apply all pending OSCs
+    ├── test_inspect.py          # Snapshot inspector
+    ├── test_replication.py      # Replication unit + live tests
     └── data/
-        ├── dc.parquet/          # Test input (DC OSM extract)
-        ├── changeset_1.xml      # Test OSC for stage 4
+        ├── WashingtonDC/
+        │   ├── dc.parquet/      # Test input (DC OSM extract)
+        │   └── osc/             # Test OSC files
         └── output/              # Test output (gitignored)
 ```
 
@@ -105,11 +107,6 @@ osc_raw → osc_dedup [osc.py] → osc_latest
 ```
 
 ## Module reference
-
-### `cli.py`
-
-`argparse` setup only. `parse_args()` returns the validated namespace; the CLI
-entry point dispatches to `main.main`.
 
 ### `main.py`
 
@@ -188,6 +185,23 @@ on purpose.
 XML parsing is pure Python because the input format demands it; the moment
 we have records, we hand them to Spark and never look back.
 
+### `replication.py`
+
+Geofabrik OSC replication downloads using pyosmium's `ReplicationServer`.
+`fetch_osc_files()` downloads pending `.osc.gz` files given a last-applied sequence
+or table timestamp.
+
+### `inspect.py`
+
+Snapshot inspector. Compares two Iceberg snapshots via a FULL OUTER JOIN
+on `(id, type)` and generates GeoJSON + an interactive HTML map viewer
+(MapLibre GL JS with a timeline slider). Key functions:
+
+- `list_snapshots(spark, table_name)` - query the `.snapshots` metadata table.
+- `diff_snapshots(spark, table_name, before, after)` - collect changed rows.
+- `inspect_snapshots(spark, table_name, output_dir, ...)` - orchestrate
+  one or more diffs, write `.geojson` files and `inspector.html`.
+
 ## Iceberg table schema
 
 ```sql
@@ -214,22 +228,20 @@ PARTITIONED BY (type)
 
 ## Tests
 
-The tests are E2E-only and chain through the same SQL functions production
-uses. All four stages write to the **same** Iceberg table
-(`hadoop_catalog.test_db.e2e_osm`); each persists its output to
-`tests/data/output/warehouse`, so you can run any stage standalone once
-its predecessors have run.
+There are no CLI entry points. The E2E tests **are** the sample scripts —
+they demonstrate exactly how to wire up a Spark session, call the library
+functions, and validate the output. A production cron job would look
+nearly identical.
+
+All stages write to the same Iceberg table (`hadoop_catalog.test_db.dc`);
+each persists its output to `tests/data/output/warehouse`, so you can
+run any stage standalone once its predecessors have run.
 
 ```bash
-make test-e2e-nodes      # stage 1
-make test-e2e-ways       # stage 2
-make test-e2e-relations  # stage 3
-make test-e2e-osc        # stage 4 (applies tests/data/changeset_1.xml)
-make test-e2e-all        # all four in order
+make test-e2e-init           # build table from Parquet
+make test-e2e-fetch-and-apply # fetch OSC from Geofabrik + apply (network)
+make test-inspect            # snapshot inspector
 ```
-
-Stage 4 calls `kryptosm.main.run_update_mode` directly so the test path is
-the production path.
 
 ## Common changes
 
@@ -250,11 +262,6 @@ Edit `create_iceberg_table` in `iceberg.py`, then make sure
 `prepare_for_iceberg` in `geometry/iceberg_prep.py` produces a matching
 shape, and update the schema block in this file. There is no migration
 story - we recreate the table.
-
-### New CLI option
-
-Add to `cli.py`'s `create_parser` and `validate_args`, then consume in
-`main.py`.
 
 ## Dependencies
 

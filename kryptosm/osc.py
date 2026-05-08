@@ -1,25 +1,46 @@
 """
-OSC (OpenStreetMap Change) ingestion.
+OSC (OpenStreetMap Change) ingestion and application.
 
-OSC files are XML, so parsing is Python. Once parsed, everything is a Spark
-DataFrame and downstream logic stays in SQL.
+Parsing is Python (XML). Once parsed, everything is a Spark DataFrame and
+downstream logic stays in SQL.
 """
 
 import gzip
-from datetime import datetime, timezone
-from functools import reduce
-from posixpath import join as urljoin
-from typing import List
+import logging
+import os
+from datetime import timezone
+from typing import Optional
 from xml.etree import ElementTree
 
 import pyspark.sql.types as T
-import requests
 from pyspark.sql import DataFrame, SparkSession
 
-# Reference point for the OSC daily-replication sequence number.
-_REF_DATE = datetime(2024, 3, 23, tzinfo=timezone.utc)
-_REF_SEQ = 4210
-_REPLICATION_BASE = "https://planet.openstreetmap.org/replication/day/"
+from .geometry.iceberg_prep import prepare_for_iceberg
+from .geometry.nodes import build_node_geometry
+from .geometry.osc_apply import all_dirty_relations, all_dirty_ways
+from .geometry.relations import (
+    construct_multipolygon,
+    relation_merge_geometry_data,
+    relations_need_geometry,
+)
+from .geometry.ways import (
+    build_linestring_for_ways,
+    build_ways_geometry_from_linestring,
+)
+from .iceberg import (
+    delete_from_table,
+    get_last_applied_sequence,
+    get_table_max_timestamp,
+    load_with_geom,
+    merge_into_table,
+    refresh_node_to_ways,
+    refresh_way_to_relations,
+    set_current_osc_file,
+    set_last_applied_sequence,
+)
+from .replication import DC_REPLICATION_URL
+
+logger = logging.getLogger(__name__)
 
 OSC_SCHEMA = T.StructType(
     [
@@ -53,22 +74,13 @@ OSC_SCHEMA = T.StructType(
 )
 
 
+# ---------------------------------------------------------------------------
+# Dedup
+# ---------------------------------------------------------------------------
+
+
 def osc_dedup(spark: SparkSession, osc_view: str, result_view: str):
-    """
-    Keep the latest version per (id, type) from the OSC stream.
-
-    Also casts the OSC's ISO-string timestamps into TIMESTAMP so that all
-    downstream views match the Iceberg table's TIMESTAMP columns. This is
-    the single funnel for OSC data, so doing the cast here means every
-    consumer (`all_dirty_ways`, `apply_osc_with_geometry`, `build_*`,
-    ...) sees the canonical type.
-
-    Input view (`osc_view`) columns:
-        id, type, op, version, timestamp (STRING), uid, user, changeset,
-        tags, lat, lon, refs, members, latest_ts (STRING)
-    Output view (`result_view`) columns:
-        same shape, but `timestamp` and `latest_ts` are TIMESTAMP.
-    """
+    """Keep the latest version per (id, type) from the OSC, cast timestamps."""
     spark.sql(f"""
         SELECT
             id,
@@ -90,46 +102,30 @@ def osc_dedup(spark: SparkSession, osc_view: str, result_view: str):
     """).createOrReplaceTempView(result_view)
 
 
-def get_osc_day_sequence_number(publish_date: str) -> int:
-    """Convert a YYYY-MM-DD date to the OSM daily-replication sequence number."""
-    target = datetime.strptime(publish_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return _REF_SEQ + (target - _REF_DATE).days
+# ---------------------------------------------------------------------------
+# Parsing OSC XML -> DataFrame
+# ---------------------------------------------------------------------------
 
 
-# ----------------------------------------------------------------------------
-# Reading OSC into a DataFrame
-# ----------------------------------------------------------------------------
-
-
-def _build_osc_url(sequence_number: int) -> str:
-    s = str(sequence_number).zfill(9)
-    return urljoin(_REPLICATION_BASE, f"{s[:3]}/{s[3:6]}/{s[6:9]}.osc.gz")
-
-
-def _fetch_xml(file_path: str = None, sequence_number: int = None) -> bytes:
-    """Return raw OSC XML bytes from either a local file or the replication server."""
-    if file_path:
-        if file_path.startswith("s3://"):
-            raise NotImplementedError("S3 OSC files not yet implemented")
-        try:
-            with gzip.GzipFile(file_path, "rb") as f:
-                return f.read()
-        except OSError:
-            with open(file_path, "rb") as f:
-                return f.read()
-
-    response = requests.get(_build_osc_url(sequence_number))
-    response.raise_for_status()
-    return gzip.decompress(response.content)
+def _fetch_xml(file_path: str) -> bytes:
+    """Return raw OSC XML bytes from a local file."""
+    if file_path.startswith("s3://"):
+        raise NotImplementedError("S3 OSC files not yet implemented")
+    try:
+        with gzip.GzipFile(file_path, "rb") as f:
+            return f.read()
+    except OSError:
+        with open(file_path, "rb") as f:
+            return f.read()
 
 
 def _parse_osc(xml_bytes: bytes) -> list:
     """Flatten OSC XML into a list of records (one row per change)."""
     records = []
     for action in ElementTree.fromstring(xml_bytes):
-        op = action.tag  # create | modify | delete
+        op = action.tag
         for element in action:
-            elem_type = element.tag  # node | way | relation
+            elem_type = element.tag
             tags, refs, members = {}, None, None
             for child in element:
                 if child.tag == "tag":
@@ -168,31 +164,193 @@ def _parse_osc(xml_bytes: bytes) -> list:
     return records
 
 
-def _osc_dataframe(
-    spark: SparkSession, *, file_path: str = None, sequence_number: int = None
-) -> DataFrame:
+def read_osc_from_file(spark: SparkSession, file_path: str) -> DataFrame:
+    """Read a local .osc or .osc.gz (or plain XML) into a DataFrame."""
     return spark.createDataFrame(
-        _parse_osc(_fetch_xml(file_path=file_path, sequence_number=sequence_number)),
+        _parse_osc(_fetch_xml(file_path)),
         OSC_SCHEMA,
     )
 
 
-def download_osc_to_dataframe(spark: SparkSession, publish_date: str) -> DataFrame:
-    """Download the daily OSC for `publish_date` (YYYY-MM-DD) and return a DataFrame."""
-    return _osc_dataframe(spark, sequence_number=get_osc_day_sequence_number(publish_date))
+# ---------------------------------------------------------------------------
+# Fetch: download the next pending OSC file
+# ---------------------------------------------------------------------------
 
 
-def read_osc_from_file(spark: SparkSession, file_path: str) -> DataFrame:
-    """Read a local .osc or .osc.gz (or plain XML) into a DataFrame."""
-    return _osc_dataframe(spark, file_path=file_path)
+def _sequence_from_path(path: str) -> Optional[int]:
+    """Extract a sequence number from a filename like ``4780.osc.gz``."""
+    stem = os.path.basename(path).split(".")[0]
+    return int(stem) if stem.isdigit() else None
 
 
-def read_osc_files(spark: SparkSession, file_paths: List[str]) -> DataFrame:
-    """Read multiple OSC files and union them into a single DataFrame."""
-    dfs = [_osc_dataframe(spark, file_path=p) for p in file_paths]
-    return reduce(DataFrame.unionAll, dfs)
+def next_osc_path(
+    spark: SparkSession,
+    table_name: str,
+    download_dir: str,
+    base_url: str = DC_REPLICATION_URL,
+) -> Optional[str]:
+    """Download the next pending OSC file and return its local path.
+
+    Returns ``None`` if the table is already up to date.
+    """
+    from osmium.replication.server import ReplicationServer
+
+    from .replication import download_osc_file, pending_sequences
+
+    last_seq = get_last_applied_sequence(spark, table_name)
+
+    with ReplicationServer(base_url) as server:
+        remote_state = server.get_state_info()
+        if remote_state is None:
+            raise RuntimeError(f"Could not fetch remote state from {base_url}")
+
+        if last_seq is None:
+            ts = get_table_max_timestamp(spark, table_name)
+            if ts is None:
+                raise ValueError(f"Table {table_name} is empty — run init first.")
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            last_seq = server.timestamp_to_sequence(ts)
+            if last_seq is None:
+                raise RuntimeError(f"Could not map timestamp {ts} to a sequence number")
+            logger.info("No stored sequence — estimated %d from MAX(timestamp) %s", last_seq, ts)
+
+        seqs = pending_sequences(last_seq, remote_state.sequence)
+        if not seqs:
+            logger.info("Table is current at sequence %d", last_seq)
+            return None
+
+        logger.info(
+            "Pending: %d file(s) (%d .. %d), downloading %d",
+            len(seqs), seqs[0], seqs[-1], seqs[0],
+        )
+        return download_osc_file(server, seqs[0], download_dir)
 
 
-def read_osc_from_parquet(spark: SparkSession, path: str) -> DataFrame:
-    """Read OSC data from pre-parsed Parquet files."""
-    return spark.read.parquet(path)
+# ---------------------------------------------------------------------------
+# Apply: apply a single OSC file to the table
+# ---------------------------------------------------------------------------
+
+
+def _osc_is_redundant(spark: SparkSession, table_name: str) -> bool:
+    """True if the OSC has nothing new for this table.
+
+    A feature needs applying if it's a create/modify with a higher version
+    than the table (or doesn't exist in the table at all), or a delete for
+    an ID that exists in the table.
+    """
+    row = spark.sql(f"""
+        SELECT COUNT(*) AS need_apply
+        FROM osc_latest o
+        LEFT JOIN {table_name} t ON o.id = t.id AND o.type = t.type
+        WHERE (o.op IN ('create', 'modify') AND (t.id IS NULL OR t.version < o.version))
+           OR (o.op = 'delete' AND t.id IS NOT NULL)
+    """).collect()[0]
+    redundant = row["need_apply"] == 0
+    if redundant:
+        logger.info("OSC is redundant — all %d features already at current version",
+                     spark.sql("SELECT COUNT(*) FROM osc_latest").collect()[0][0])
+    else:
+        logger.info("OSC has %d features to apply", row["need_apply"])
+    return redundant
+
+
+def apply_osc(
+    spark: SparkSession,
+    table_name: str,
+    osc_path: str,
+    node_to_ways: str,
+    way_to_relations: str,
+) -> None:
+    """Apply a single OSC file to the Iceberg table.
+
+    One file -> one dedup -> one geometry rebuild -> one MERGE per type.
+    Stamps ``current-osc-file`` and ``last-applied-osc-sequence`` on the
+    table so the next call to ``next_osc_path`` picks up where we left off.
+
+    Skips the expensive geometry/MERGE pipeline entirely if every feature
+    in the OSC is already in the table at the same or higher version.
+    """
+    label = os.path.basename(osc_path)
+    set_current_osc_file(spark, table_name, label)
+
+    read_osc_from_file(spark, osc_path).createOrReplaceTempView("osc_raw")
+    osc_dedup(spark, "osc_raw", "osc_latest")
+
+    if _osc_is_redundant(spark, table_name):
+        logger.info("%s: fully redundant, skipping", label)
+        seq = _sequence_from_path(osc_path)
+        if seq is not None:
+            set_last_applied_sequence(spark, table_name, seq)
+        return
+
+    logger.info("%s: applying changes", label)
+
+    for osm_type in ("node", "way", "relation"):
+        load_with_geom(spark, table_name, osm_type, f"base_{osm_type}s")
+
+        spark.sql(f"""
+            SELECT * FROM osc_latest
+            WHERE type = '{osm_type}' AND op IN ('create', 'modify')
+        """).createOrReplaceTempView(f"osc_{osm_type}_upserts")
+
+        spark.sql(f"""
+            SELECT id FROM osc_latest WHERE type = '{osm_type}' AND op = 'delete'
+        """).createOrReplaceTempView(f"osc_{osm_type}_deletes")
+
+    # --- Nodes ---------------------------------------------------------------
+    build_node_geometry(spark, "osc_node_upserts", "updated_nodes_geom")
+    prepare_for_iceberg(spark, "updated_nodes_geom", "node", "nodes_iceberg")
+    merge_into_table(spark, table_name, "nodes_iceberg", "t.id = s.id AND t.type = 'node'")
+    delete_from_table(spark, table_name, "osc_node_deletes", "t.id = s.id AND t.type = 'node'")
+    load_with_geom(spark, table_name, "node", "nodes_with_geom")
+    logger.info("%s: nodes merged", label)
+
+    # --- Ways ----------------------------------------------------------------
+    all_dirty_ways(
+        spark, "base_ways", "osc_way_upserts", "osc_node_upserts",
+        node_to_ways, "dirty_ways",
+    )
+    spark.sql("SELECT DISTINCT id FROM dirty_ways").persist().createOrReplaceTempView("_dirty_way_ids")
+
+    build_linestring_for_ways(spark, "dirty_ways", "nodes_with_geom", "dirty_ways_lines")
+    build_ways_geometry_from_linestring(spark, "dirty_ways_lines", "dirty_ways_geom")
+    prepare_for_iceberg(spark, "dirty_ways_geom", "way", "ways_iceberg")
+    merge_into_table(spark, table_name, "ways_iceberg", "t.id = s.id AND t.type = 'way'")
+    delete_from_table(spark, table_name, "osc_way_deletes", "t.id = s.id AND t.type = 'way'")
+
+    refresh_node_to_ways(spark, table_name, node_to_ways, "_dirty_way_ids")
+    spark.sql(f"DELETE FROM {node_to_ways} WHERE way_id IN (SELECT id FROM osc_way_deletes)")
+    load_with_geom(spark, table_name, "way", "ways_with_geom")
+    logger.info("%s: ways merged + index updated", label)
+
+    # --- Relations -----------------------------------------------------------
+    all_dirty_relations(
+        spark, "base_relations", "osc_relation_upserts", "dirty_ways",
+        way_to_relations, "dirty_relations",
+    )
+    spark.sql(
+        "SELECT DISTINCT id FROM dirty_relations"
+    ).persist().createOrReplaceTempView("_dirty_rel_ids")
+
+    relations_need_geometry(spark, "dirty_relations", "rels_need_geom")
+    construct_multipolygon(spark, "rels_need_geom", "ways_with_geom", "rels_geom")
+    relation_merge_geometry_data(spark, "dirty_relations", "rels_geom", "dirty_rels_geom")
+    prepare_for_iceberg(spark, "dirty_rels_geom", "relation", "relations_iceberg")
+    merge_into_table(
+        spark, table_name, "relations_iceberg", "t.id = s.id AND t.type = 'relation'"
+    )
+    delete_from_table(
+        spark, table_name, "osc_relation_deletes", "t.id = s.id AND t.type = 'relation'"
+    )
+
+    refresh_way_to_relations(spark, table_name, way_to_relations, "_dirty_rel_ids")
+    spark.sql(
+        f"DELETE FROM {way_to_relations} WHERE relation_id IN (SELECT id FROM osc_relation_deletes)"
+    )
+    logger.info("%s: relations merged + index updated", label)
+
+    seq = _sequence_from_path(osc_path)
+    if seq is not None:
+        set_last_applied_sequence(spark, table_name, seq)
+        logger.info("%s: stamped sequence %d", label, seq)
