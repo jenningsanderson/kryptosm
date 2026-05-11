@@ -83,7 +83,8 @@ def test_init():
 
         with stage("Build + write relations"):
             relations_need_geometry(spark, "input_relations", "relations_need_geom")
-            construct_multipolygon(spark, "relations_need_geom", "ways_with_geom", "relations_geom")
+            construct_multipolygon(spark, "relations_need_geom", "ways_with_geom", "relations_geom",
+                                   nodes_geometry="nodes_with_geom")
             relation_merge_geometry_data(
                 spark, "input_relations", "relations_geom", "relations_with_geom"
             )

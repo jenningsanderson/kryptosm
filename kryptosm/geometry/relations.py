@@ -4,19 +4,23 @@ Relation geometry: MultiPolygon or MultiLineString per OSM relation.
 Relations bundle multiple ways (and sometimes nodes/relations) under a
 single ID with role labels. The `tags['type']` decides what we build:
 
-    multipolygon, boundary  -> MultiPolygon (outer ways minus inner ways)
-    route, waterway         -> MultiLineString (all member ways unioned)
+    multipolygon, boundary, building, bridge -> MultiPolygon
+    route, waterway                          -> MultiLineString
 
-Anything else gets a NULL geometry and is still written to the table.
+All other relation types are kept in the table with NULL geometry.
 """
 
 from pyspark.sql import SparkSession
 
 # Relation `tags['type']` values for which we build geometry.
-GEOMETRY_RELATION_TYPES = ("multipolygon", "boundary", "route", "waterway")
+GEOMETRY_RELATION_TYPES = (
+    "multipolygon", "boundary", "building", "bridge",
+    "route", "waterway", "site",
+)
 
-_POLYGON_TYPES = ("multipolygon", "boundary")
+_POLYGON_TYPES = ("multipolygon", "boundary", "building", "bridge")
 _LINE_TYPES = ("route", "waterway")
+_COLLECTION_TYPES = ("site",)
 
 
 def _quote_csv(values) -> str:
@@ -48,44 +52,32 @@ def relations_need_geometry(spark: SparkSession, relations_data: str, result_vie
 
 
 def construct_multipolygon(
-    spark: SparkSession, relations_data: str, ways_geometry: str, result_view: str
+    spark: SparkSession, relations_data: str, ways_geometry: str, result_view: str,
+    nodes_geometry: str = None,
 ):
     """
-    Build geometries for relations - polygon and line types in one shot.
+    Build geometries for relations — polygon, line, and collection types.
 
-    Input view (`relations_data`) columns:
-        id, members (ARRAY<STRUCT<type, ref, role>>), tags, latest_ts
-        (typically the output of `relations_need_geometry`)
-    Input view (`ways_geometry`) columns:
-        id, latest_ts, geom
-
-    Output view (`result_view`) columns:
-        id, latest_ts, geom (ST_MultiPolygon for polygon types,
-                             ST_MultiLineString for line types)
-
-    Why:
-        - We posexplode `relations_data.members` exactly once into
-          `_rel_member_ways(relation_id, relation_type, relation_latest_ts,
-          way_id, role)`. All four downstream branches (outer / inner / line /
-          combine) read from that one view instead of re-scanning + re-exploding
-          `relations_data` each time.
-        - Outer / inner are unioned then `ST_BuildArea`'d to handle the common
-          case where multiple ways together form a single ring.
-        - Inner polygons (holes) are subtracted with ST_Difference.
-        - Members with empty / NULL `role` are normalized to 'outer' per OSM
-          convention. Line types ignore role entirely.
-        - Intermediate views are prefixed with `_` so they don't collide with
-          caller-managed view names.
+    ``nodes_geometry`` is optional. When provided, site relations can include
+    node members as points in a GeometryCollection alongside any way members.
     """
-    # ----- pre-explode members once -----------------------------------------
-    # This is the only scan of `relations_data` in this function.
+    # ----- pre-explode direct way members ------------------------------------
+    # Normalize roles: 'outline' (building/bridge) → 'outer',
+    # 'part' (building) → 'outer' (each part is a polygon in the MultiPolygon).
+    # Empty/missing roles default to 'outer' per OSM convention.
     spark.sql(f"""
         SELECT
             r.id                                  AS relation_id,
             r.tags['type']                        AS relation_type,
             r.latest_ts                           AS relation_latest_ts,
             m.member.ref                          AS way_id,
-            COALESCE(NULLIF(m.member.role, ''), 'outer') AS role
+            CASE
+                WHEN m.member.role IN ('inner')           THEN 'inner'
+                WHEN m.member.role IN ('outer', 'outline',
+                                       'part', '')        THEN 'outer'
+                WHEN m.member.role IS NULL                 THEN 'outer'
+                ELSE m.member.role
+            END AS role
         FROM {relations_data} r
         LATERAL VIEW posexplode(r.members) m AS pos, member
         WHERE m.member.type = 'way'
@@ -126,8 +118,7 @@ def construct_multipolygon(
         GROUP BY rm.relation_id
     """).createOrReplaceTempView("_inner_polygons")
 
-    # ----- polygon relations: outer minus inner, validated ------------------
-    # FULL OUTER JOIN keeps relations that have only outers OR only inners.
+    # ----- polygon relations from direct ways: outer minus inner ------------
     spark.sql("""
         SELECT
             COALESCE(o.id, i.id)                   AS id,
@@ -145,6 +136,48 @@ def construct_multipolygon(
             ) AS geom
         FROM _outer_polygons o
         FULL OUTER JOIN _inner_polygons i ON o.id = i.id
+    """).createOrReplaceTempView("_polygon_from_ways")
+
+    # ----- include sub-relation geometries as complete pieces ---------------
+    # Sub-relations already have their geometry built (from their own ways).
+    # We collect them and union with the parent's direct-way geometry.
+    spark.sql(f"""
+        SELECT
+            parent_id,
+            ST_Union_Aggr(sub_geom)                AS sub_geom,
+            MAX(sub_latest_ts)                     AS sub_latest_ts
+        FROM (
+            SELECT
+                r.id                               AS parent_id,
+                sub.geom                           AS sub_geom,
+                sub.latest_ts                      AS sub_latest_ts
+            FROM (
+                SELECT id, explode(members) AS member
+                FROM {relations_data}
+            ) r
+            JOIN _polygon_from_ways sub ON sub.id = r.member.ref
+            WHERE r.member.type = 'relation'
+        )
+        GROUP BY parent_id
+    """).createOrReplaceTempView("_sub_relation_geoms")
+
+    spark.sql("""
+        SELECT
+            COALESCE(p.id, s.parent_id)            AS id,
+            GREATEST(
+                COALESCE(p.latest_ts, s.sub_latest_ts),
+                COALESCE(s.sub_latest_ts, p.latest_ts)
+            )                                      AS latest_ts,
+            ST_MakeValid(
+                CASE
+                    WHEN p.geom IS NOT NULL AND s.sub_geom IS NOT NULL
+                        THEN ST_Union(p.geom, s.sub_geom)
+                    WHEN p.geom IS NOT NULL THEN p.geom
+                    ELSE s.sub_geom
+                END
+            ) AS geom
+        FROM _polygon_from_ways p
+        FULL OUTER JOIN _sub_relation_geoms s ON p.id = s.parent_id
     """).createOrReplaceTempView("_polygon_relations")
 
     # ----- line relations: union of all member-way geometries ---------------
@@ -163,10 +196,79 @@ def construct_multipolygon(
         GROUP BY rm.relation_id
     """).createOrReplaceTempView("_line_relations")
 
+    # ----- collection relations (site): ways + nodes as GeometryCollection ---
+    collection_types = _quote_csv(_COLLECTION_TYPES)
+
+    if nodes_geometry:
+        # Collect way geometries for collection-type relations
+        spark.sql(f"""
+            SELECT rm.relation_id AS id,
+                   MAX(rm.relation_latest_ts) AS latest_ts,
+                   ST_Union_Aggr(lines.geom) AS geom
+            FROM (
+                SELECT DISTINCT relation_id, relation_latest_ts, way_id
+                FROM _rel_member_ways
+                WHERE relation_type IN ({collection_types})
+            ) rm
+            JOIN {ways_geometry} lines ON rm.way_id = lines.id
+            WHERE lines.geom IS NOT NULL
+            GROUP BY rm.relation_id
+        """).createOrReplaceTempView("_collection_ways")
+
+        # Collect node geometries for collection-type relations
+        spark.sql(f"""
+            SELECT r.id AS relation_id,
+                   MAX(r.latest_ts) AS latest_ts,
+                   ST_Union_Aggr(n.geom) AS geom
+            FROM (
+                SELECT id, latest_ts, explode(members) AS member
+                FROM {relations_data}
+                WHERE tags['type'] IN ({collection_types})
+            ) r
+            JOIN {nodes_geometry} n ON n.id = r.member.ref
+            WHERE r.member.type = 'node'
+              AND n.geom IS NOT NULL
+            GROUP BY r.id
+        """).createOrReplaceTempView("_collection_nodes")
+
+        # Merge way and node geometries
+        spark.sql("""
+            SELECT
+                COALESCE(w.id, n.relation_id) AS id,
+                GREATEST(
+                    COALESCE(w.latest_ts, n.latest_ts),
+                    COALESCE(n.latest_ts, w.latest_ts)
+                ) AS latest_ts,
+                CASE
+                    WHEN w.geom IS NOT NULL AND n.geom IS NOT NULL
+                        THEN ST_Union(w.geom, n.geom)
+                    WHEN w.geom IS NOT NULL THEN w.geom
+                    ELSE n.geom
+                END AS geom
+            FROM _collection_ways w
+            FULL OUTER JOIN _collection_nodes n ON w.id = n.relation_id
+        """).createOrReplaceTempView("_collection_relations")
+    else:
+        spark.sql(f"""
+            SELECT rm.relation_id AS id,
+                   MAX(rm.relation_latest_ts) AS latest_ts,
+                   ST_Union_Aggr(lines.geom) AS geom
+            FROM (
+                SELECT DISTINCT relation_id, relation_latest_ts, way_id
+                FROM _rel_member_ways
+                WHERE relation_type IN ({collection_types})
+            ) rm
+            JOIN {ways_geometry} lines ON rm.way_id = lines.id
+            WHERE lines.geom IS NOT NULL
+            GROUP BY rm.relation_id
+        """).createOrReplaceTempView("_collection_relations")
+
     spark.sql("""
         SELECT id, latest_ts, geom FROM _polygon_relations
         UNION ALL
         SELECT id, latest_ts, geom FROM _line_relations
+        UNION ALL
+        SELECT id, latest_ts, geom FROM _collection_relations
     """).createOrReplaceTempView(result_view)
 
 

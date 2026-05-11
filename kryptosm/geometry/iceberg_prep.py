@@ -37,31 +37,12 @@ def prepare_for_iceberg(
     """
     Project a geom-bearing view into the Iceberg table's column layout.
 
-    Input view (`data_view`) columns:
-        id, version, timestamp, uid, user, changeset, tags, lat, lon, refs,
-        members, latest_ts, geom
-
-    Output view (`result_view`) columns:
-        id, type, version, timestamp, changeset, uid, user, tags, lat, lon,
-        refs, members, latest_ts, geometry (BINARY WKB),
-        bbox (STRUCT<xmin, xmax, ymin, ymax: FLOAT>)
-
-    Args:
-        osm_type: 'node' | 'way' | 'relation' - pinned into the `type` column
-                  and used to decide whether to simplify huge geometries.
-
-    Why:
-        - Iceberg stores geometries as WKB BINARY; Sedona's `geom` is an
-          internal type that needs explicit serialization with ST_AsBinary.
-        - Rows with NULL geom are dropped here so writers don't see
-          half-built features (relation types without geometry are kept
-          via a different path - this view is only for written features).
-        - The bbox struct is a hand-rolled secondary index for cheap spatial
-          filtering without round-tripping the WKB.
-        - We deliberately do NOT call `.repartition()` here. With AQE on, a
-          forced shuffle right before write is pure overhead. Iceberg's
-          `WRITE.distribution-mode` controls output layout properly.
+    For nodes and ways, rows with NULL geom are dropped (they failed
+    geometry construction). For relations, NULL geom is kept — many
+    relation types intentionally have no geometry.
     """
+    geom_filter = "WHERE geom IS NOT NULL" if osm_type != "relation" else ""
+
     spark.sql(f"""
         SELECT
             id,
@@ -77,13 +58,17 @@ def prepare_for_iceberg(
             refs,
             members,
             CAST(latest_ts AS TIMESTAMP)        AS latest_ts,
-            {_geometry_expr(osm_type)}          AS geometry,
-            STRUCT(
-                CAST(ST_XMin(geom) AS FLOAT) AS xmin,
-                CAST(ST_XMax(geom) AS FLOAT) AS xmax,
-                CAST(ST_YMin(geom) AS FLOAT) AS ymin,
-                CAST(ST_YMax(geom) AS FLOAT) AS ymax
-            )                                   AS bbox
+            CASE WHEN geom IS NOT NULL
+                 THEN {_geometry_expr(osm_type)}
+            END                                 AS geometry,
+            CASE WHEN geom IS NOT NULL THEN
+                STRUCT(
+                    CAST(ST_XMin(geom) AS FLOAT) AS xmin,
+                    CAST(ST_XMax(geom) AS FLOAT) AS xmax,
+                    CAST(ST_YMin(geom) AS FLOAT) AS ymin,
+                    CAST(ST_YMax(geom) AS FLOAT) AS ymax
+                )
+            END                                 AS bbox
         FROM {data_view}
-        WHERE geom IS NOT NULL
+        {geom_filter}
     """).createOrReplaceTempView(result_view)
