@@ -25,3 +25,4 @@ from .geometry.relations import (
     relation_merge_geometry_data,
     relations_need_geometry,
 )
+from .geometry.samples import sample_geojson

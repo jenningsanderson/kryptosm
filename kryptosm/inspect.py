@@ -148,14 +148,16 @@ def _row_to_features(row, step: int, committed_at: str, osc_file: str = "") -> l
     geojson_str = row["geojson_before"] if change == "deleted" else row["geojson_after"]
     geometry = json.loads(geojson_str) if geojson_str else None
 
-    tags = row["tags_before"] if change == "deleted" else row["tags_after"]
-    props = dict(tags) if tags else {}
+    tags = dict(row["tags_before"] or {}) if change == "deleted" else dict(row["tags_after"] or {})
 
-    props["@id"] = row["id"]
-    props["@type"] = row["type"]
-    props["@change"] = change
-    props["@step"] = step
-    props["@committed_at"] = committed_at
+    props = {
+        "@id": row["id"],
+        "@type": row["type"],
+        "@change": change,
+        "@step": step,
+        "@committed_at": committed_at,
+        "@tags": tags,
+    }
     if osc_file:
         props["@osc_file"] = osc_file
 
@@ -390,13 +392,14 @@ map.on('load', function() {
             lines.push('&bull; ' + esc(k) + ': ' + (v[0]||'&empty;') + ' &rarr; ' + (v[1]||'&empty;'));
           }
         }
-        var tagLines = [];
-        for (var k in p) {
-          if (k[0] !== '@') tagLines.push(esc(k) + ' = ' + esc(String(p[k])));
-        }
-        if (tagLines.length) {
-          lines.push('<b>Tags:</b>');
-          tagLines.forEach(function(t) { lines.push('&bull; ' + t); });
+        var tags = tryParse(p['@tags']);
+        if (tags && typeof tags === 'object') {
+          var tagLines = [];
+          for (var k in tags) tagLines.push(esc(k) + ' = ' + esc(String(tags[k])));
+          if (tagLines.length) {
+            lines.push('<b>Tags:</b>');
+            tagLines.forEach(function(t) { lines.push('&bull; ' + t); });
+          }
         }
       }
       new maplibregl.Popup({maxWidth: '360px'})
