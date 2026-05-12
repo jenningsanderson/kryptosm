@@ -3,6 +3,7 @@ kryptosm — turn OpenStreetMap data into a single Apache Iceberg table.
 """
 
 from .iceberg import (
+    TableConfig,
     create_iceberg_table,
     create_index_tables,
     get_table_count,
