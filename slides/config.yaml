@@ -1,0 +1,8 @@
+title: kryptosm
+base_url: /kryptosm/
+
+output: index.html
+
+serve:
+  port: 3000
+  no_open: false
