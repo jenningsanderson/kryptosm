@@ -6,6 +6,7 @@ Set KRYPTOSM_REGION=oregon to use Oregon data (default: dc).
 """
 
 from kryptosm import (
+    TableConfig,
     build_linestring_for_ways,
     build_node_geometry,
     build_ways_geometry_from_linestring,
@@ -46,8 +47,9 @@ def test_init():
 
     try:
         with stage("Create Iceberg table + index tables"):
-            create_iceberg_table(spark, region.table_name)
-            create_index_tables(spark, region.node_to_ways, region.way_to_relations)
+            cfg = TableConfig.testing()
+            create_iceberg_table(spark, region.table_name, config=cfg)
+            create_index_tables(spark, region.node_to_ways, region.way_to_relations, config=cfg)
 
         with stage("Register input Parquet views"):
             spark.read.parquet(str(region.parquet_path / "type=node")).createOrReplaceTempView(

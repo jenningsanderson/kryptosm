@@ -3,12 +3,79 @@ Iceberg table operations for the OSM table.
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TableConfig:
+    """Tunable Iceberg table properties for different data scales."""
+
+    distribution_mode: str = "range"
+    bloom_filter_enabled: bool = True
+    bloom_filter_max_bytes: Optional[int] = 1_048_576
+
+    @classmethod
+    def testing(cls) -> "TableConfig":
+        """Optimized settings for local tests (< 10M records)."""
+        return cls(
+            distribution_mode="range",
+            bloom_filter_enabled=True,
+            bloom_filter_max_bytes=131_072,
+        )
+
+    @classmethod
+    def production(cls) -> "TableConfig":
+        """Full optimization for planet-scale data (10B+ records)."""
+        return cls(
+            distribution_mode="range",
+            bloom_filter_enabled=True,
+            bloom_filter_max_bytes=1_048_576,
+        )
+
+    def _main_table_props(self) -> str:
+        lines = [
+            "'format'='parquet'",
+            "'write.parquet.compression-codec'='snappy'",
+            "'format-version'='2'",
+            "'write.metadata.compression-codec'='none'",
+            f"'write.distribution-mode'='{self.distribution_mode}'",
+            "'write.delete.mode'='merge-on-read'",
+            "'write.update.mode'='merge-on-read'",
+            "'write.merge.mode'='merge-on-read'",
+        ]
+        if self.distribution_mode == "range":
+            lines.append("'write.sort-order'='id ASC'")
+        if self.bloom_filter_enabled:
+            lines.append("'write.parquet.bloom-filter-enabled.column.id'='true'")
+            if self.bloom_filter_max_bytes:
+                lines.append(
+                    f"'write.parquet.bloom-filter-max-bytes.column.id'='{self.bloom_filter_max_bytes}'"
+                )
+        return ",\n            ".join(lines)
+
+    def _index_table_props(self, sort_col: str) -> str:
+        lines = [
+            "'format'='parquet'",
+            "'write.parquet.compression-codec'='snappy'",
+            "'format-version'='2'",
+            f"'write.distribution-mode'='{self.distribution_mode}'",
+        ]
+        if self.distribution_mode == "range":
+            lines.append(f"'write.sort-order'='{sort_col} ASC'")
+        if self.bloom_filter_enabled:
+            lines.append(f"'write.parquet.bloom-filter-enabled.column.{sort_col}'='true'")
+            if self.bloom_filter_max_bytes:
+                lines.append(
+                    f"'write.parquet.bloom-filter-max-bytes.column.{sort_col}'"
+                    f"='{self.bloom_filter_max_bytes}'"
+                )
+        return ",\n            ".join(lines)
 
 
 def table_exists(spark: SparkSession, table_name: str) -> bool:
@@ -41,8 +108,11 @@ def create_iceberg_table(
     spark: SparkSession,
     table_name: str,
     table_location: Optional[str] = None,
+    config: Optional[TableConfig] = None,
 ):
     """Create the OSM Iceberg table (idempotent: drops first to guarantee schema)."""
+    if config is None:
+        config = TableConfig()
     _ensure_db(spark, table_name)
     spark.sql(f"DROP TABLE IF EXISTS {table_name}")
 
@@ -74,17 +144,10 @@ def create_iceberg_table(
         PARTITIONED BY (type)
         {location_clause}
         TBLPROPERTIES (
-            'format'='parquet',
-            'write.parquet.compression-codec'='snappy',
-            'format-version'='2',
-            'write.metadata.compression-codec'='none',
-            'write.distribution-mode'='none',
-            'write.delete.mode'='merge-on-read',
-            'write.update.mode'='merge-on-read',
-            'write.merge.mode'='merge-on-read'
+            {config._main_table_props()}
         )
     """)
-    logger.info("Created table %s", table_name)
+    logger.info("Created table %s (config=%s)", table_name, config)
 
 
 # ---------------------------------------------------------------------------
@@ -92,23 +155,28 @@ def create_iceberg_table(
 # ---------------------------------------------------------------------------
 
 
-def create_index_tables(spark: SparkSession, node_to_ways: str, way_to_relations: str):
+def create_index_tables(
+    spark: SparkSession,
+    node_to_ways: str,
+    way_to_relations: str,
+    config: Optional[TableConfig] = None,
+):
     """Create the reverse-index tables used for dirty-set computation."""
+    if config is None:
+        config = TableConfig()
     for idx in (node_to_ways, way_to_relations):
         _ensure_db(spark, idx)
 
-    for idx, cols in [
-        (node_to_ways, "node_id BIGINT, way_id BIGINT"),
-        (way_to_relations, "way_id BIGINT, relation_id BIGINT"),
+    for idx, cols, sort_col in [
+        (node_to_ways, "node_id BIGINT, way_id BIGINT", "node_id"),
+        (way_to_relations, "way_id BIGINT, relation_id BIGINT", "way_id"),
     ]:
         spark.sql(f"DROP TABLE IF EXISTS {idx}")
         spark.sql(f"""
             CREATE TABLE {idx} ({cols})
             USING iceberg
             TBLPROPERTIES (
-                'format'='parquet',
-                'write.parquet.compression-codec'='snappy',
-                'format-version'='2'
+                {config._index_table_props(sort_col)}
             )
         """)
 

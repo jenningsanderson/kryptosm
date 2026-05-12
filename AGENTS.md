@@ -226,6 +226,21 @@ USING iceberg
 PARTITIONED BY (type)
 ```
 
+Data is sorted by `id ASC` within each partition with bloom filters on
+`id` for fast point lookups during MERGE and geometry joins. Distribution
+mode is `range` so writes produce sorted files.
+
+The two index tables (`node_to_ways`, `way_to_relations`) use the same
+sort-order and bloom-filter settings via `TableConfig`.
+
+`TableConfig` controls these Iceberg table properties at creation time:
+- `distribution_mode` — `'range'` (production) or `'none'` (testing)
+- `bloom_filter_enabled` — `True` for production, `False` for testing
+- `bloom_filter_max_bytes` — `1048576` (1 MB) for production, `None` for testing
+
+Use `TableConfig.testing()` for local/CI runs and `TableConfig.production()`
+for planet-scale data.
+
 ## Tests
 
 There are no CLI entry points. The E2E tests **are** the sample scripts —
