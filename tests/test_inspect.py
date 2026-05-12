@@ -31,7 +31,11 @@ def test_inspect():
     print(f"Table: {region.table_name}\n")
 
     with stage("Spark session"):
-        spark = create_spark_session_for_testing(str(WAREHOUSE_DIR))
+        spark = create_spark_session_for_testing(
+            str(WAREHOUSE_DIR),
+            driver_memory=region.driver_memory,
+            parallelism=region.parallelism,
+        )
 
     if inspect_dir.exists():
         for f in inspect_dir.iterdir():

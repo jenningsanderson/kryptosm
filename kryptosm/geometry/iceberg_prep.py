@@ -40,11 +40,13 @@ def prepare_for_iceberg(
     For nodes and ways, rows with NULL geom are dropped (they failed
     geometry construction). For relations, NULL geom is kept — many
     relation types intentionally have no geometry.
-    """
-    geom_filter = "WHERE geom IS NOT NULL" if osm_type != "relation" else ""
 
-    spark.sql(f"""
-        SELECT
+    Relations use a UNION ALL split instead of CASE WHEN because Sedona
+    1.8.x can produce JTS-null-in-UDT objects that pass ``IS NOT NULL``
+    but NPE when any geometry function touches them. The WHERE filter in
+    the first branch runs at the scan level, before expression evaluation.
+    """
+    _columns = f"""
             id,
             CAST('{osm_type}' AS STRING)        AS type,
             CAST(version AS BIGINT)             AS version,
@@ -57,18 +59,43 @@ def prepare_for_iceberg(
             lon,
             refs,
             members,
-            CAST(latest_ts AS TIMESTAMP)        AS latest_ts,
-            CASE WHEN geom IS NOT NULL
-                 THEN {_geometry_expr(osm_type)}
-            END                                 AS geometry,
-            CASE WHEN geom IS NOT NULL THEN
+            CAST(latest_ts AS TIMESTAMP)        AS latest_ts"""
+
+    if osm_type != "relation":
+        spark.sql(f"""
+            SELECT
+                {_columns},
+                ST_AsBinary(geom)                   AS geometry,
                 STRUCT(
                     CAST(ST_XMin(geom) AS FLOAT) AS xmin,
                     CAST(ST_XMax(geom) AS FLOAT) AS xmax,
                     CAST(ST_YMin(geom) AS FLOAT) AS ymin,
                     CAST(ST_YMax(geom) AS FLOAT) AS ymax
-                )
-            END                                 AS bbox
-        FROM {data_view}
-        {geom_filter}
-    """).createOrReplaceTempView(result_view)
+                )                                   AS bbox
+            FROM {data_view}
+            WHERE geom IS NOT NULL
+        """).createOrReplaceTempView(result_view)
+    else:
+        spark.sql(f"""
+            SELECT
+                {_columns},
+                {_geometry_expr(osm_type)}          AS geometry,
+                STRUCT(
+                    CAST(ST_XMin(geom) AS FLOAT) AS xmin,
+                    CAST(ST_XMax(geom) AS FLOAT) AS xmax,
+                    CAST(ST_YMin(geom) AS FLOAT) AS ymin,
+                    CAST(ST_YMax(geom) AS FLOAT) AS ymax
+                )                                   AS bbox
+            FROM {data_view}
+            WHERE geom IS NOT NULL
+            UNION ALL
+            SELECT
+                {_columns},
+                CAST(NULL AS BINARY)                AS geometry,
+                CAST(NULL AS
+                    STRUCT<xmin: FLOAT, xmax: FLOAT,
+                           ymin: FLOAT, ymax: FLOAT>
+                )                                   AS bbox
+            FROM {data_view}
+            WHERE geom IS NULL
+        """).createOrReplaceTempView(result_view)

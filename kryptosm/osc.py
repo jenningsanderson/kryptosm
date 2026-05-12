@@ -336,7 +336,8 @@ def apply_osc(
     relations_need_geometry(spark, "dirty_relations", "rels_need_geom")
     construct_multipolygon(spark, "rels_need_geom", "ways_with_geom", "rels_geom",
                            nodes_geometry="nodes_with_geom")
-    relation_merge_geometry_data(spark, "dirty_relations", "rels_geom", "dirty_rels_geom")
+    relation_merge_geometry_data(spark, "dirty_relations", "rels_geom", "dirty_rels_geom",
+                                ways_geometry="ways_with_geom", nodes_geometry="nodes_with_geom")
     prepare_for_iceberg(spark, "dirty_rels_geom", "relation", "relations_iceberg")
     merge_into_table(
         spark, table_name, "relations_iceberg", "t.id = s.id AND t.type = 'relation'"

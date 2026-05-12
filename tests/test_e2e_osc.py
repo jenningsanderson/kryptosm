@@ -31,7 +31,11 @@ def test_apply_next_osc():
     print(f"Table: {region.table_name}\n")
 
     with stage("Spark session"):
-        spark = create_spark_session_for_testing(str(WAREHOUSE_DIR))
+        spark = create_spark_session_for_testing(
+            str(WAREHOUSE_DIR),
+            driver_memory=region.driver_memory,
+            parallelism=region.parallelism,
+        )
 
     try:
         assert table_exists(spark, region.table_name), \

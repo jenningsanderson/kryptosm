@@ -35,6 +35,8 @@ class Region:
     db_name: str
     parquet_path: Path
     replication_url: str
+    driver_memory: str = "2g"
+    parallelism: int = 8
 
     @property
     def table_name(self) -> str:
@@ -63,6 +65,8 @@ REGIONS = {
         db_name="oregon",
         parquet_path=_DATA_DIR / "Oregon" / "oregon.parquet",
         replication_url="https://download.geofabrik.de/north-america/us/oregon-updates/",
+        driver_memory="8g",
+        parallelism=4,
     ),
 }
 
@@ -77,8 +81,16 @@ def get_region() -> Region:
 
 def create_spark_session_for_testing(
     warehouse_dir: str = str(WAREHOUSE_DIR),
+    driver_memory: str = "2g",
+    parallelism: int = 8,
 ) -> SparkSession:
-    """Local-mode Spark+Sedona+Iceberg session for E2E tests."""
+    """Local-mode Spark+Sedona+Iceberg session for E2E tests.
+
+    Larger datasets (Oregon, planet) need more heap and fewer concurrent
+    writers to avoid OOM during bloom-filter allocation and range-sort
+    shuffle spills.  Callers can tune via ``driver_memory`` and
+    ``parallelism``.
+    """
     from sedona.spark import SedonaContext
 
     # Clear any stopped session so getOrCreate doesn't return a dead one.
@@ -93,7 +105,7 @@ def create_spark_session_for_testing(
 
     builder = (
         SparkSession.builder.appName("KryptOSM Test")
-        .master("local[8]")
+        .master(f"local[{parallelism}]")
         .config("spark.driver.extraJavaOptions", "-Djts.overlay=ng")
         .config("spark.executor.extraJavaOptions", "-Djts.overlay=ng")
         .config("sedona.join.numpartition", "4000")
@@ -102,7 +114,7 @@ def create_spark_session_for_testing(
         .config("spark.sql.catalog.hadoop_catalog", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.hadoop_catalog.type", "hadoop")
         .config("spark.sql.catalog.hadoop_catalog.warehouse", warehouse_dir)
-        .config("spark.driver.memory", "2g")
+        .config("spark.driver.memory", driver_memory)
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.port", "0")

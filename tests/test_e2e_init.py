@@ -43,7 +43,11 @@ def test_init():
     print(f"Table:     {region.table_name}\n")
 
     with stage("Spark session"):
-        spark = create_spark_session_for_testing(str(WAREHOUSE_DIR))
+        spark = create_spark_session_for_testing(
+            str(WAREHOUSE_DIR),
+            driver_memory=region.driver_memory,
+            parallelism=region.parallelism,
+        )
 
     try:
         with stage("Create Iceberg table + index tables"):
@@ -88,7 +92,8 @@ def test_init():
             construct_multipolygon(spark, "relations_need_geom", "ways_with_geom", "relations_geom",
                                    nodes_geometry="nodes_with_geom")
             relation_merge_geometry_data(
-                spark, "input_relations", "relations_geom", "relations_with_geom"
+                spark, "input_relations", "relations_geom", "relations_with_geom",
+                ways_geometry="ways_with_geom", nodes_geometry="nodes_with_geom",
             )
             prepare_for_iceberg(spark, "relations_with_geom", "relation", "relations_final")
             spark.sql("SELECT * FROM relations_final") \

@@ -87,11 +87,12 @@ def construct_multipolygon(
     line_types = _quote_csv(_LINE_TYPES)
 
     # ----- polygon side: outer rings ----------------------------------------
+    # Step 1: union member-way geometries per relation.
     spark.sql(f"""
         SELECT
             rm.relation_id                          AS id,
             MAX(rm.relation_latest_ts)              AS latest_ts,
-            ST_BuildArea(ST_Union_Aggr(lines.geom)) AS geom
+            ST_Union_Aggr(lines.geom)               AS union_geom
         FROM (
             SELECT DISTINCT relation_id, relation_latest_ts, way_id
             FROM _rel_member_ways
@@ -99,7 +100,19 @@ def construct_multipolygon(
         ) rm
         JOIN {ways_geometry} lines ON rm.way_id = lines.id
         WHERE lines.geom IS NOT NULL
+              AND NOT ST_IsEmpty(lines.geom)
         GROUP BY rm.relation_id
+    """).createOrReplaceTempView("_outer_unions")
+
+    # Step 2: build polygons only from closed unions.  ST_BuildArea returns
+    # JTS null when the input lines don't form closed rings, and Sedona
+    # 1.8.x doesn't null-check function return values → NPE in the
+    # serializer.  Filtering on ST_IsClosed prevents that.
+    spark.sql("""
+        SELECT id, latest_ts,
+            ST_BuildArea(union_geom) AS geom
+        FROM _outer_unions
+        WHERE ST_IsClosed(union_geom)
     """).createOrReplaceTempView("_outer_polygons")
 
     # ----- polygon side: inner rings (holes) --------------------------------
@@ -107,7 +120,7 @@ def construct_multipolygon(
         SELECT
             rm.relation_id                          AS id,
             MAX(rm.relation_latest_ts)              AS latest_ts,
-            ST_BuildArea(ST_Union_Aggr(lines.geom)) AS geom
+            ST_Union_Aggr(lines.geom)               AS union_geom
         FROM (
             SELECT DISTINCT relation_id, relation_latest_ts, way_id
             FROM _rel_member_ways
@@ -115,7 +128,15 @@ def construct_multipolygon(
         ) rm
         JOIN {ways_geometry} lines ON rm.way_id = lines.id
         WHERE lines.geom IS NOT NULL
+              AND NOT ST_IsEmpty(lines.geom)
         GROUP BY rm.relation_id
+    """).createOrReplaceTempView("_inner_unions")
+
+    spark.sql("""
+        SELECT id, latest_ts,
+            ST_BuildArea(union_geom) AS geom
+        FROM _inner_unions
+        WHERE ST_IsClosed(union_geom)
     """).createOrReplaceTempView("_inner_polygons")
 
     # ----- polygon relations from direct ways: outer minus inner ------------
@@ -123,17 +144,12 @@ def construct_multipolygon(
         SELECT
             COALESCE(o.id, i.id)                   AS id,
             COALESCE(o.latest_ts, i.latest_ts)     AS latest_ts,
-            ST_ReducePrecision(
-                ST_MakeValid(
-                    CASE
-                        WHEN o.geom IS NOT NULL AND i.geom IS NOT NULL
-                            THEN ST_Difference(o.geom, i.geom)
-                        WHEN o.geom IS NOT NULL THEN o.geom
-                        ELSE i.geom
-                    END
-                ),
-                7
-            ) AS geom
+            CASE
+                WHEN o.geom IS NOT NULL AND i.geom IS NOT NULL
+                    THEN ST_Difference(o.geom, i.geom)
+                WHEN o.geom IS NOT NULL THEN o.geom
+                ELSE i.geom
+            END AS geom
         FROM _outer_polygons o
         FULL OUTER JOIN _inner_polygons i ON o.id = i.id
     """).createOrReplaceTempView("_polygon_from_ways")
@@ -157,6 +173,7 @@ def construct_multipolygon(
             ) r
             JOIN _polygon_from_ways sub ON sub.id = r.member.ref
             WHERE r.member.type = 'relation'
+                  AND sub.geom IS NOT NULL
         )
         GROUP BY parent_id
     """).createOrReplaceTempView("_sub_relation_geoms")
@@ -168,14 +185,12 @@ def construct_multipolygon(
                 COALESCE(p.latest_ts, s.sub_latest_ts),
                 COALESCE(s.sub_latest_ts, p.latest_ts)
             )                                      AS latest_ts,
-            ST_MakeValid(
-                CASE
-                    WHEN p.geom IS NOT NULL AND s.sub_geom IS NOT NULL
-                        THEN ST_Union(p.geom, s.sub_geom)
-                    WHEN p.geom IS NOT NULL THEN p.geom
-                    ELSE s.sub_geom
-                END
-            ) AS geom
+            CASE
+                WHEN p.geom IS NOT NULL AND s.sub_geom IS NOT NULL
+                    THEN ST_Collect(p.geom, s.sub_geom)
+                WHEN p.geom IS NOT NULL THEN p.geom
+                ELSE s.sub_geom
+            END AS geom
         FROM _polygon_from_ways p
         FULL OUTER JOIN _sub_relation_geoms s ON p.id = s.parent_id
     """).createOrReplaceTempView("_polygon_relations")
@@ -193,6 +208,7 @@ def construct_multipolygon(
         ) rm
         JOIN {ways_geometry} lines ON rm.way_id = lines.id
         WHERE lines.geom IS NOT NULL
+              AND NOT ST_IsEmpty(lines.geom)
         GROUP BY rm.relation_id
     """).createOrReplaceTempView("_line_relations")
 
@@ -212,6 +228,7 @@ def construct_multipolygon(
             ) rm
             JOIN {ways_geometry} lines ON rm.way_id = lines.id
             WHERE lines.geom IS NOT NULL
+                  AND NOT ST_IsEmpty(lines.geom)
             GROUP BY rm.relation_id
         """).createOrReplaceTempView("_collection_ways")
 
@@ -231,7 +248,10 @@ def construct_multipolygon(
             GROUP BY r.id
         """).createOrReplaceTempView("_collection_nodes")
 
-        # Merge way and node geometries
+        # Merge way and node geometries into a GeometryCollection.
+        # ST_Collect instead of ST_Union: way geometries are a mix of
+        # polygons and linestrings, and ST_Union rejects GeometryCollection
+        # inputs.
         spark.sql("""
             SELECT
                 COALESCE(w.id, n.relation_id) AS id,
@@ -241,7 +261,7 @@ def construct_multipolygon(
                 ) AS latest_ts,
                 CASE
                     WHEN w.geom IS NOT NULL AND n.geom IS NOT NULL
-                        THEN ST_Union(w.geom, n.geom)
+                        THEN ST_Collect(w.geom, n.geom)
                     WHEN w.geom IS NOT NULL THEN w.geom
                     ELSE n.geom
                 END AS geom
@@ -260,6 +280,7 @@ def construct_multipolygon(
             ) rm
             JOIN {ways_geometry} lines ON rm.way_id = lines.id
             WHERE lines.geom IS NOT NULL
+                  AND NOT ST_IsEmpty(lines.geom)
             GROUP BY rm.relation_id
         """).createOrReplaceTempView("_collection_relations")
 
@@ -273,27 +294,68 @@ def construct_multipolygon(
 
 
 def relation_merge_geometry_data(
-    spark: SparkSession, relations_data: str, geometry_only_data: str, result_view: str
+    spark: SparkSession, relations_data: str, geometry_only_data: str, result_view: str,
+    ways_geometry: str = None, nodes_geometry: str = None,
 ):
     """
     Left-join all relations with their built geometry.
 
-    Input view (`relations_data`) columns:
-        id, version, timestamp, uid, user, changeset, tags, lat, lon, members
-        (the FULL relation set, not just the geometry-bearing ones)
-    Input view (`geometry_only_data`) columns:
-        id, latest_ts, geom (output of `construct_multipolygon`)
-
-    Output view (`result_view`) columns:
-        id, version, timestamp, uid, user, changeset, tags, lat, lon,
-        refs (NULL ARRAY<BIGINT>), members, latest_ts, geom (or NULL)
-
-    Why:
-        - Relations whose `tags['type']` isn't in GEOMETRY_RELATION_TYPES
-          still belong in the table - they just carry NULL geometry.
-        - Empty geometries (e.g. ST_Difference produced no area) collapse
-          to NULL so consumers don't see `EMPTY` shapes.
+    Relations that already have typed geometry (from ``construct_multipolygon``)
+    keep it. Relations without geometry get a fallback GeometryCollection built
+    from whatever member way/node geometries are available, giving them a
+    meaningful bbox.
     """
+    if ways_geometry:
+        # Only compute fallback for relations that construct_multipolygon
+        # didn't produce geometry for — avoids exploding all members.
+        spark.sql(f"""
+            SELECT id, members FROM {relations_data}
+            WHERE id NOT IN (
+                SELECT id FROM {geometry_only_data}
+                WHERE geom IS NOT NULL
+            )
+        """).createOrReplaceTempView("_rels_needing_fallback")
+
+        parts = [f"""
+            SELECT r.id AS relation_id,
+                   ST_Union_Aggr(w.geom) AS member_geom
+            FROM (
+                SELECT id, explode(members) AS member
+                FROM _rels_needing_fallback
+            ) r
+            JOIN {ways_geometry} w ON w.id = r.member.ref
+            WHERE r.member.type = 'way'
+                  AND w.geom IS NOT NULL
+            GROUP BY r.id
+        """]
+        if nodes_geometry:
+            parts.append(f"""
+                SELECT r.id AS relation_id,
+                       ST_Union_Aggr(n.geom) AS member_geom
+                FROM (
+                    SELECT id, explode(members) AS member
+                    FROM _rels_needing_fallback
+                ) r
+                JOIN {nodes_geometry} n ON n.id = r.member.ref
+                WHERE r.member.type = 'node'
+                      AND n.geom IS NOT NULL
+                GROUP BY r.id
+            """)
+        union_parts = " UNION ALL ".join(parts)
+        spark.sql(f"""
+            SELECT relation_id,
+                   ST_Union_Aggr(member_geom) AS geom
+            FROM ({union_parts})
+            GROUP BY relation_id
+        """).createOrReplaceTempView("_fallback_geom")
+        fallback_join = "LEFT OUTER JOIN _fallback_geom f ON a.id = f.relation_id"
+        fallback_expr = """
+            COALESCE(b.geom, f.geom)"""
+    else:
+        fallback_join = ""
+        fallback_expr = """
+            b.geom"""
+
     spark.sql(f"""
         SELECT
             a.id,
@@ -311,10 +373,8 @@ def relation_merge_geometry_data(
                 COALESCE(a.timestamp, current_timestamp()),
                 COALESCE(b.latest_ts, timestamp_seconds(0))
             ) AS latest_ts,
-            CASE
-                WHEN b.geom IS NULL OR ST_IsEmpty(b.geom) THEN NULL
-                ELSE ST_MakeValid(b.geom)
-            END AS geom
+            {fallback_expr} AS geom
         FROM {relations_data} a
         LEFT OUTER JOIN {geometry_only_data} b ON a.id = b.id
+        {fallback_join}
     """).createOrReplaceTempView(result_view)
