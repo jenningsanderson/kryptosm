@@ -14,7 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: jenningsanderson/slides@main
+        with:
+          submodules: true
+      - uses: ./.github/actions/slides
         with:
           slides-dir: slides
           output-dir: dist

@@ -1,0 +1,3 @@
+[submodule ".github/actions/slides"]
+	path = .github/actions/slides
+	url = https://github.com/jenningsanderson/slides
