@@ -4,6 +4,16 @@ Convert a `geom` view into the layout the Iceberg OSM table expects.
 This is the last step of the pipeline. It serializes geometries to WKB,
 adds the bbox struct, pins the partition column (`type`), and repartitions
 for parallel write.
+
+Hygiene applied at the WKB boundary (see ``_hygienic_geom``):
+    * ``ST_Force_2D``          — strip any Z value
+    * ``ST_ReducePrecision``   — snap to a fixed decimal grid
+    * ``ST_MakeValid``         — repair topology (self-intersections,
+                                 sliver artifacts from ST_Difference,
+                                 ring orientation problems)
+    * ``ST_ForcePolygonCCW``   — canonical OGC / RFC 7946 winding
+
+The pipeline order is deliberate; see ``_hygienic_geom`` for rationale.
 """
 
 from pyspark.sql import SparkSession
@@ -16,15 +26,50 @@ MAXIMUM_RELATION_GEOMETRY_SIZE = 30_000_000
 # degrees is ~10 cm at the equator - imperceptible at country scale.
 HUGE_GEOMETRY_SIMPLIFICATION_FACTOR = 0.000001
 
+# Decimal-degree precision applied to every geometry at the WKB boundary.
+# 7 decimals ≈ 1.1 cm at the equator — finer than OSM source precision and
+# matches the per-node ST_ReducePrecision applied in nodes.py, so this is
+# idempotent for nodes and additionally protects ways/relations whose
+# coordinates are derived through joins, unions, and overlay operations.
+WKB_PRECISION_DECIMALS = 7
+
+
+def _hygienic_geom(geom_expr: str = "geom") -> str:
+    """SQL fragment producing a 2D, precision-snapped, valid, CCW-wound geometry.
+
+    Pipeline order is deliberate:
+
+      1. ``ST_Force_2D``         — strip any Z value (cheap, harmless on 2D).
+      2. ``ST_ReducePrecision``  — snap coordinates to a fixed grid; can in
+                                   theory introduce invalidity by collapsing
+                                   near-coincident points into duplicates,
+                                   so it must run BEFORE MakeValid.
+      3. ``ST_MakeValid``        — repair topology: self-intersections,
+                                   collapsed slivers, ring orientation issues
+                                   left over from ST_BuildArea / ST_Difference
+                                   in the relation pipeline. Idempotent and
+                                   nearly free on already-valid inputs.
+      4. ``ST_ForcePolygonCCW``  — canonical OGC / RFC 7946 winding (CCW
+                                   exterior, CW interiors). No-op on
+                                   non-polygon geometries, idempotent on
+                                   already-CCW polygons.
+    """
+    expr = f"ST_Force_2D({geom_expr})"
+    expr = f"ST_ReducePrecision({expr}, {WKB_PRECISION_DECIMALS})"
+    expr = f"ST_MakeValid({expr})"
+    expr = f"ST_ForcePolygonCCW({expr})"
+    return expr
+
 
 def _geometry_expr(osm_type: str) -> str:
     """SQL expression that serializes `geom` to WKB, simplifying huge relations."""
+    clean = _hygienic_geom("geom")
     if osm_type != "relation":
-        return "ST_AsBinary(geom)"
+        return f"ST_AsBinary({clean})"
     return (
-        f"IF (LENGTH(ST_AsBinary(geom)) < {MAXIMUM_RELATION_GEOMETRY_SIZE}, "
-        f"    ST_AsBinary(geom), "
-        f"    ST_AsBinary(ST_SimplifyPreserveTopology(geom, {HUGE_GEOMETRY_SIMPLIFICATION_FACTOR})))"
+        f"IF (LENGTH(ST_AsBinary({clean})) < {MAXIMUM_RELATION_GEOMETRY_SIZE}, "
+        f"    ST_AsBinary({clean}), "
+        f"    ST_AsBinary(ST_SimplifyPreserveTopology({clean}, {HUGE_GEOMETRY_SIMPLIFICATION_FACTOR})))"
     )
 
 
@@ -65,7 +110,7 @@ def prepare_for_iceberg(
         spark.sql(f"""
             SELECT
                 {_columns},
-                ST_AsBinary(geom)                   AS geometry,
+                ST_AsBinary({_hygienic_geom("geom")})  AS geometry,
                 STRUCT(
                     CAST(ST_XMin(geom) AS FLOAT) AS xmin,
                     CAST(ST_XMax(geom) AS FLOAT) AS xmax,
