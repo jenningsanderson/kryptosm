@@ -14,11 +14,12 @@ from .geometry.relations import (
 )
 from .geometry.samples import sample_geojson
 from .geometry.ways import (
-    build_linestring_for_ways,
-    build_ways_geometry_from_linestring,
+    build_way_linestrings,
+    promote_closed_ways_to_areas,
     flatten_way_refs,
 )
 from .iceberg import (
+    KryptonDatabase,
     TableConfig,
     append_osc_archive,
     create_index_tables,

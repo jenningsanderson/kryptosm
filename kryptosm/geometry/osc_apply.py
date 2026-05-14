@@ -15,6 +15,8 @@ pipeline actually uses for that type. ``dirty_ways`` carries no
 columns either.
 """
 
+from typing import Optional
+
 from pyspark.sql import SparkSession
 
 
@@ -66,9 +68,9 @@ def all_dirty_relations(
     dirty_ways: str,
     way_to_relations_table: str,
     result_view: str,
-    dirty_nodes: str = None,
-    node_to_relations_table: str = None,
-    relation_to_relations_table: str = None,
+    dirty_nodes: Optional[str] = None,
+    node_to_relations_table: Optional[str] = None,
+    relation_to_relations_table: Optional[str] = None,
 ):
     """
     Relations that need geometry rebuilt: direct OSC changes + relations

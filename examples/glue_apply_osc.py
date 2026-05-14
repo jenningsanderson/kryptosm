@@ -14,8 +14,8 @@ import os
 import sys
 import tempfile
 
-from kryptosm import apply_osc, get_table_count, next_osc_path
-from kryptosm.iceberg import get_last_applied_sequence, table_exists
+from kryptosm import KryptonDatabase, apply_osc, get_table_count, next_osc_path
+from kryptosm.iceberg import get_min_applied_sequence, table_exists
 from pyspark.sql import SparkSession
 from sedona.spark import SedonaContext
 
@@ -23,23 +23,13 @@ from sedona.spark import SedonaContext
 # Config — edit these for your environment
 # ---------------------------------------------------------------------------
 WAREHOUSE        = "s3://meta-overture-staging/transportation_splitter/planet-iceberg/warehouse/"
-CATALOG          = "glue_catalog"
-DB_NAME          = "kryptosm"
+db = KryptonDatabase(catalog="glue_catalog", db_name="kryptosm")
 
 # /tmp on Glue is fast local SSD, wiped between runs — fine, OSC files are tiny.
 OSC_STAGING_DIR  = tempfile.gettempdir()
 
 # Planet replication (day). Use a country/region URL for sub-planet jobs.
 REPLICATION_URL  = "https://planet.openstreetmap.org/replication/day/"
-
-NODES_TABLE            = f"{CATALOG}.{DB_NAME}.nodes"
-WAYS_TABLE             = f"{CATALOG}.{DB_NAME}.ways"
-RELATIONS_TABLE        = f"{CATALOG}.{DB_NAME}.relations"
-NODE_TO_WAYS           = f"{CATALOG}.{DB_NAME}.node_to_ways"
-WAY_TO_RELATIONS       = f"{CATALOG}.{DB_NAME}.way_to_relations"
-NODE_TO_RELATIONS      = f"{CATALOG}.{DB_NAME}.node_to_relations"
-RELATION_TO_RELATIONS  = f"{CATALOG}.{DB_NAME}.relation_to_relations"
-OSC_ARCHIVE            = f"{CATALOG}.{DB_NAME}.osc_changes"
 
 # ---------------------------------------------------------------------------
 # Logging — sent to stdout so Glue/CloudWatch picks it up
@@ -53,14 +43,14 @@ logging.basicConfig(
 logging.getLogger("kryptosm").setLevel(logging.INFO)
 logger = logging.getLogger("kryptosm.glue_apply_osc")
 
-logger.info("kryptosm OSC APPLY (Glue) — db=%s.%s", CATALOG, DB_NAME)
+logger.info("kryptosm OSC APPLY (Glue) — db=%s.%s", db.catalog, db.db_name)
 logger.info("  replication: %s", REPLICATION_URL)
 
 # ---------------------------------------------------------------------------
 # Spark / Sedona / Iceberg session
 # ---------------------------------------------------------------------------
 spark = SedonaContext.create(
-    SparkSession.builder.appName(f"kryptosm-osc-{DB_NAME}")
+    SparkSession.builder.appName(f"kryptosm-osc-{db.db_name}")
     .config("spark.driver.extraJavaOptions", "-Djts.overlay=ng")
     .config("spark.executor.extraJavaOptions", "-Djts.overlay=ng")
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
@@ -69,10 +59,10 @@ spark = SedonaContext.create(
         "spark.sql.extensions",
         "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
     )
-    .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
-    .config(f"spark.sql.catalog.{CATALOG}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
-    .config(f"spark.sql.catalog.{CATALOG}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-    .config(f"spark.sql.catalog.{CATALOG}.warehouse", WAREHOUSE)
+    .config(f"spark.sql.catalog.{db.catalog}", "org.apache.iceberg.spark.SparkCatalog")
+    .config(f"spark.sql.catalog.{db.catalog}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config(f"spark.sql.catalog.{db.catalog}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config(f"spark.sql.catalog.{db.catalog}.warehouse", WAREHOUSE)
     .config("spark.sql.adaptive.enabled", "true")
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     .getOrCreate()
@@ -90,14 +80,14 @@ if _jts_overlay != "ng":
 # ---------------------------------------------------------------------------
 # Verify the per-type tables exist (init must have run first)
 # ---------------------------------------------------------------------------
-for tbl in (NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE, OSC_ARCHIVE):
+for tbl in (db.nodes, db.ways, db.relations, db.osc_archive):
     assert table_exists(spark, tbl), f"{tbl} does not exist. Run glue_init.py first."
 
 # ---------------------------------------------------------------------------
 # Counts BEFORE
 # ---------------------------------------------------------------------------
-before = get_table_count(spark, NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE)
-seq_before = get_last_applied_sequence(spark, OSC_ARCHIVE)
+before = get_table_count(spark, db.nodes, db.ways, db.relations)
+seq_before = get_min_applied_sequence(spark, db.nodes, db.ways, db.relations)
 logger.info("sequence BEFORE: %s", seq_before)
 
 # ---------------------------------------------------------------------------
@@ -106,8 +96,7 @@ logger.info("sequence BEFORE: %s", seq_before)
 os.makedirs(OSC_STAGING_DIR, exist_ok=True)
 osc_path = next_osc_path(
     spark,
-    NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE,
-    OSC_ARCHIVE,
+    db.nodes, db.ways, db.relations,
     OSC_STAGING_DIR,
     base_url=REPLICATION_URL,
 )
@@ -120,17 +109,17 @@ if osc_path is None:
 logger.info("Applying %s (%d bytes)", os.path.basename(osc_path), os.path.getsize(osc_path))
 apply_osc(
     spark, osc_path,
-    NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE,
-    NODE_TO_WAYS, WAY_TO_RELATIONS,
-    NODE_TO_RELATIONS, RELATION_TO_RELATIONS,
-    OSC_ARCHIVE,
+    db.nodes, db.ways, db.relations,
+    db.node_to_ways, db.way_to_relations,
+    db.node_to_relations, db.relation_to_relations,
+    db.osc_archive,
 )
 
 # ---------------------------------------------------------------------------
 # Counts AFTER
 # ---------------------------------------------------------------------------
-after = get_table_count(spark, NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE)
-seq_after = get_last_applied_sequence(spark, OSC_ARCHIVE)
+after = get_table_count(spark, db.nodes, db.ways, db.relations)
+seq_after = get_min_applied_sequence(spark, db.nodes, db.ways, db.relations)
 
 for osm_type in ("node", "way", "relation"):
     b = before.get(osm_type, 0)

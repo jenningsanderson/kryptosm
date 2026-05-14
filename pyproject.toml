@@ -1,6 +1,6 @@
 [project]
 name = "kryptosm"
-version = "0.4.0"
+version = "0.5.0"
 description = "A utility for processing OpenStreetMap data into Apache Iceberg tables"
 requires-python = ">=3.8"
 license = {text = "Apache-2.0"}
@@ -24,6 +24,7 @@ dependencies = [
     "pyspark==3.5.0",
     "apache-sedona==1.8.1",
     "osmium>=4.0.0",
+    "pandas",
 ]
 
 [project.optional-dependencies]

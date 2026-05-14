@@ -14,10 +14,11 @@ import logging
 import sys
 
 from kryptosm import (
+    KryptonDatabase,
     TableConfig,
-    build_linestring_for_ways,
+    build_way_linestrings,
     build_node_geometry,
-    build_ways_geometry_from_linestring,
+    promote_closed_ways_to_areas,
     construct_multipolygon,
     create_index_tables,
     create_nodes_table,
@@ -45,21 +46,11 @@ from sedona.spark import SedonaContext
 # ---------------------------------------------------------------------------
 INPUT_PARQUET = "s3://meta-overture-staging/planet-iceberg/raw/"
 WAREHOUSE     = "s3://meta-overture-staging/transportation-splitter/planet-iceberg/warehouse/"
-CATALOG       = "glue_catalog"
-DB_NAME       = "kryptosm"
+db = KryptonDatabase(catalog="glue_catalog", db_name="kryptosm")
 
 # When True, do NOT drop/recreate existing tables, and skip any per-type write
 # step whose rows already exist. Set to False for a clean rebuild from scratch.
 RESUME        = True
-
-NODES_TABLE            = f"{CATALOG}.{DB_NAME}.nodes"
-WAYS_TABLE             = f"{CATALOG}.{DB_NAME}.ways"
-RELATIONS_TABLE        = f"{CATALOG}.{DB_NAME}.relations"
-NODE_TO_WAYS           = f"{CATALOG}.{DB_NAME}.node_to_ways"
-WAY_TO_RELATIONS       = f"{CATALOG}.{DB_NAME}.way_to_relations"
-NODE_TO_RELATIONS      = f"{CATALOG}.{DB_NAME}.node_to_relations"
-RELATION_TO_RELATIONS  = f"{CATALOG}.{DB_NAME}.relation_to_relations"
-OSC_ARCHIVE            = f"{CATALOG}.{DB_NAME}.osc_changes"
 
 # ---------------------------------------------------------------------------
 # Logging — sent to stdout so Glue/CloudWatch picks it up
@@ -73,7 +64,7 @@ logging.basicConfig(
 logging.getLogger("kryptosm").setLevel(logging.INFO)
 logger = logging.getLogger("kryptosm.glue_init")
 
-logger.info("kryptosm INIT (Glue) — db=%s  RESUME=%s", DB_NAME, RESUME)
+logger.info("kryptosm INIT (Glue) — db=%s  RESUME=%s", db.db_name, RESUME)
 logger.info("  input:     %s", INPUT_PARQUET)
 logger.info("  warehouse: %s", WAREHOUSE)
 
@@ -87,7 +78,7 @@ logger.info("  warehouse: %s", WAREHOUSE)
 # kept here so the script also works under a fresh `spark-submit` locally.
 # ---------------------------------------------------------------------------
 spark = SedonaContext.create(
-    SparkSession.builder.appName(f"kryptosm-init-{DB_NAME}")
+    SparkSession.builder.appName(f"kryptosm-init-{db.db_name}")
     .config("spark.driver.extraJavaOptions", "-Djts.overlay=ng")
     .config("spark.executor.extraJavaOptions", "-Djts.overlay=ng")
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
@@ -96,10 +87,10 @@ spark = SedonaContext.create(
         "spark.sql.extensions",
         "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
     )
-    .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
-    .config(f"spark.sql.catalog.{CATALOG}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
-    .config(f"spark.sql.catalog.{CATALOG}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
-    .config(f"spark.sql.catalog.{CATALOG}.warehouse", WAREHOUSE)
+    .config(f"spark.sql.catalog.{db.catalog}", "org.apache.iceberg.spark.SparkCatalog")
+    .config(f"spark.sql.catalog.{db.catalog}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config(f"spark.sql.catalog.{db.catalog}.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config(f"spark.sql.catalog.{db.catalog}.warehouse", WAREHOUSE)
     .config("spark.sql.adaptive.enabled", "true")
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     .getOrCreate()
@@ -126,32 +117,32 @@ def _has_rows(name: str) -> bool:
 # ---------------------------------------------------------------------------
 # [1/8] Create per-type tables + indexes + OSC archive (skipped on RESUME)
 # ---------------------------------------------------------------------------
-have_nodes     = RESUME and _has_rows(NODES_TABLE)
-have_ways      = RESUME and _has_rows(WAYS_TABLE)
-have_relations = RESUME and _has_rows(RELATIONS_TABLE)
+have_nodes     = RESUME and _has_rows(db.nodes)
+have_ways      = RESUME and _has_rows(db.ways)
+have_relations = RESUME and _has_rows(db.relations)
 
 if have_nodes and have_ways and have_relations:
     logger.info("[1/8] RESUME — all per-type tables exist with data")
 else:
     logger.info("[1/8] Create per-type tables + indexes + OSC archive")
-    if not (RESUME and table_exists(spark, NODES_TABLE)):
-        create_nodes_table(spark, NODES_TABLE, config=TableConfig.nodes_production())
-    if not (RESUME and table_exists(spark, WAYS_TABLE)):
-        create_ways_table(spark, WAYS_TABLE, config=TableConfig.ways_production())
-    if not (RESUME and table_exists(spark, RELATIONS_TABLE)):
+    if not (RESUME and table_exists(spark, db.nodes)):
+        create_nodes_table(spark, db.nodes, config=TableConfig.nodes_production())
+    if not (RESUME and table_exists(spark, db.ways)):
+        create_ways_table(spark, db.ways, config=TableConfig.ways_production())
+    if not (RESUME and table_exists(spark, db.relations)):
         create_relations_table(
-            spark, RELATIONS_TABLE, config=TableConfig.relations_production()
+            spark, db.relations, config=TableConfig.relations_production()
         )
-    if not (RESUME and table_exists(spark, NODE_TO_WAYS)):
+    if not (RESUME and table_exists(spark, db.node_to_ways)):
         create_index_tables(
-            spark, NODE_TO_WAYS, WAY_TO_RELATIONS,
-            node_to_relations=NODE_TO_RELATIONS,
-            relation_to_relations=RELATION_TO_RELATIONS,
+            spark, db.node_to_ways, db.way_to_relations,
+            node_to_relations=db.node_to_relations,
+            relation_to_relations=db.relation_to_relations,
             config=TableConfig.ways_production(),
         )
-    if not (RESUME and table_exists(spark, OSC_ARCHIVE)):
+    if not (RESUME and table_exists(spark, db.osc_archive)):
         create_osc_archive_table(
-            spark, OSC_ARCHIVE, config=TableConfig.ways_production()
+            spark, db.osc_archive, config=TableConfig.ways_production()
         )
 
 # ---------------------------------------------------------------------------
@@ -169,7 +160,7 @@ spark.read.parquet(f"{base}/type=relation").createOrReplaceTempView("input_relat
 # ---------------------------------------------------------------------------
 if have_nodes:
     logger.info("[3/8] RESUME — nodes already loaded, loading view from table")
-    load_with_geom(spark, NODES_TABLE, "nodes_with_geom")
+    load_with_geom(spark, db.nodes, "nodes_with_geom")
 else:
     logger.info("[3/8] Build + write nodes")
     build_node_geometry(spark, "input_nodes", "nodes_with_geom")
@@ -177,96 +168,138 @@ else:
     (
         spark.sql("SELECT * FROM nodes_final")
         .repartitionByRange(2000, col("id"))
-        .writeTo(NODES_TABLE)
+        .writeTo(db.nodes)
         .using("iceberg")
         .append()
     )
-    load_with_geom(spark, NODES_TABLE, "nodes_with_geom")
+    load_with_geom(spark, db.nodes, "nodes_with_geom")
 
 # ---------------------------------------------------------------------------
 # [4/8] Build + write ways  (skipped on RESUME if already present)
 # ---------------------------------------------------------------------------
 if have_ways:
     logger.info("[4/8] RESUME — ways already loaded, loading view from table")
-    load_with_geom(spark, WAYS_TABLE, "ways_with_geom")
+    load_with_geom(spark, db.ways, "ways_with_geom")
 else:
     logger.info("[4/8] Build + write ways")
-    build_linestring_for_ways(spark, "input_ways", "nodes_with_geom", "ways_linestrings")
-    build_ways_geometry_from_linestring(spark, "ways_linestrings", "ways_with_geom")
+    build_way_linestrings(spark, "input_ways", "nodes_with_geom", "ways_linestrings")
+    promote_closed_ways_to_areas(spark, "ways_linestrings", "ways_with_geom")
     prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final")
     (
         spark.sql("SELECT * FROM ways_final")
         .repartitionByRange(500, col("id"))
-        .writeTo(WAYS_TABLE)
+        .writeTo(db.ways)
         .using("iceberg")
         .append()
     )
-    load_with_geom(spark, WAYS_TABLE, "ways_with_geom")
+    load_with_geom(spark, db.ways, "ways_with_geom")
 
 # ---------------------------------------------------------------------------
 # [5/8] Populate node_to_ways index  (skipped if already populated)
 # ---------------------------------------------------------------------------
-if RESUME and _has_rows(NODE_TO_WAYS):
+if RESUME and _has_rows(db.node_to_ways):
     logger.info("[5/8] RESUME — node_to_ways already populated, skipping")
 else:
     logger.info("[5/8] Populate node_to_ways index")
-    populate_node_to_ways(spark, WAYS_TABLE, NODE_TO_WAYS)
+    populate_node_to_ways(spark, db.ways, db.node_to_ways)
 
 # ---------------------------------------------------------------------------
 # [6/8] Build + write relations  (skipped on RESUME if already present)
+#
+# Pre-filter ways and nodes to only those referenced by relation members.
+# construct_multipolygon joins the ways view ~4 times (outer/inner polygon
+# rings, line relations, collection relations) and relation_merge_geometry_data
+# joins it ~2 more (fallback geometry, additional_changesets).  Without
+# filtering, each join independently scans the full ways Iceberg table from S3.
+# Persisting the filtered subset (typically <2% of all ways) turns those
+# repeated full scans into one scan + cached lookups.  Same logic for nodes.
 # ---------------------------------------------------------------------------
 if have_relations:
     logger.info("[6/8] RESUME — relations already loaded, skipping")
 else:
     logger.info("[6/8] Build + write relations")
+
+    spark.sql("""
+        SELECT DISTINCT member.ref AS id
+        FROM (SELECT explode(members) AS member FROM input_relations)
+        WHERE member.type = 'way'
+    """).createOrReplaceTempView("_rel_way_ids")
+    ways_for_rels = spark.sql("""
+        SELECT w.*
+        FROM ways_with_geom w
+        JOIN _rel_way_ids r ON w.id = r.id
+    """).persist()
+    ways_for_rels.createOrReplaceTempView("ways_for_relations")
+
+    spark.sql("""
+        SELECT DISTINCT member.ref AS id
+        FROM (SELECT explode(members) AS member FROM input_relations)
+        WHERE member.type = 'node'
+    """).createOrReplaceTempView("_rel_node_ids")
+    nodes_for_rels = spark.sql("""
+        SELECT n.*
+        FROM nodes_with_geom n
+        JOIN _rel_node_ids r ON n.id = r.id
+    """).persist()
+    nodes_for_rels.createOrReplaceTempView("nodes_for_relations")
+
     relations_need_geometry(spark, "input_relations", "relations_need_geom")
     construct_multipolygon(
         spark,
         "relations_need_geom",
-        "ways_with_geom",
+        "ways_for_relations",
         "relations_geom",
-        nodes_geometry="nodes_with_geom",
+        nodes_geometry="nodes_for_relations",
     )
     relation_merge_geometry_data(
         spark,
         "input_relations",
         "relations_geom",
         "relations_with_geom",
-        ways_geometry="ways_with_geom",
-        nodes_geometry="nodes_with_geom",
+        ways_geometry="ways_for_relations",
+        nodes_geometry="nodes_for_relations",
     )
     prepare_for_iceberg(spark, "relations_with_geom", "relation", "relations_final")
-    spark.sql("SELECT * FROM relations_final").writeTo(RELATIONS_TABLE).using("iceberg").append()
+    (
+        spark.sql("SELECT * FROM relations_final")
+        .repartitionByRange(20, col("id"))
+        .writeTo(db.relations)
+        .using("iceberg")
+        .append()
+    )
+
+    ways_for_rels.unpersist()
+    nodes_for_rels.unpersist()
 
 # ---------------------------------------------------------------------------
 # [7/8] Populate way_to_relations / node_to_relations / relation_to_relations
 # ---------------------------------------------------------------------------
-if RESUME and _has_rows(WAY_TO_RELATIONS):
+if RESUME and _has_rows(db.way_to_relations):
     logger.info("[7/8] RESUME — way_to_relations already populated, skipping")
 else:
     logger.info("[7/8] Populate way_to_relations index")
-    populate_way_to_relations(spark, RELATIONS_TABLE, WAY_TO_RELATIONS)
+    populate_way_to_relations(spark, db.relations, db.way_to_relations)
 
-if RESUME and _has_rows(NODE_TO_RELATIONS):
+if RESUME and _has_rows(db.node_to_relations):
     logger.info("[7/8] RESUME — node_to_relations already populated, skipping")
 else:
     logger.info("[7/8] Populate node_to_relations index")
-    populate_node_to_relations(spark, RELATIONS_TABLE, NODE_TO_RELATIONS)
+    populate_node_to_relations(spark, db.relations, db.node_to_relations)
 
-if RESUME and _has_rows(RELATION_TO_RELATIONS):
+if RESUME and _has_rows(db.relation_to_relations):
     logger.info("[7/8] RESUME — relation_to_relations already populated, skipping")
 else:
     logger.info("[7/8] Populate relation_to_relations index")
-    populate_relation_to_relations(spark, RELATIONS_TABLE, RELATION_TO_RELATIONS)
+    populate_relation_to_relations(spark, db.relations, db.relation_to_relations)
 
 # ---------------------------------------------------------------------------
 # [8/8] Final counts
 # ---------------------------------------------------------------------------
 logger.info("[8/8] Final counts")
-counts = get_table_count(spark, NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE)
+counts = get_table_count(spark, db.nodes, db.ways, db.relations)
 for osm_type in ("node", "way", "relation"):
     logger.info("  %-9s %16d", osm_type, counts.get(osm_type, 0))
 logger.info("  %-9s %16d", "total", sum(counts.values()))
-logger.info("kryptosm INIT complete — %s.%s", CATALOG, DB_NAME)
+logger.info("kryptosm INIT complete — %s.%s", db.catalog, db.db_name)
 
 spark.stop()

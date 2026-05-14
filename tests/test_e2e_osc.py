@@ -10,7 +10,7 @@ import os
 
 import pytest
 from kryptosm import apply_osc, get_table_count, next_osc_path
-from kryptosm.iceberg import get_last_applied_sequence, table_exists
+from kryptosm.iceberg import get_min_applied_sequence, table_exists
 from tests import (
     WAREHOUSE_DIR,
     configure_logging,
@@ -50,7 +50,9 @@ def test_apply_next_osc():
                 region.ways_table,
                 region.relations_table,
             )
-            seq_before = get_last_applied_sequence(spark, region.osc_archive)
+            seq_before = get_min_applied_sequence(
+                spark, region.nodes_table, region.ways_table, region.relations_table,
+            )
             print(f"  sequence: {seq_before}")
 
         with stage("Fetch next OSC"):
@@ -59,7 +61,6 @@ def test_apply_next_osc():
                 region.nodes_table,
                 region.ways_table,
                 region.relations_table,
-                region.osc_archive,
                 str(region.osc_dir),
                 base_url=region.replication_url,
             )
@@ -86,7 +87,9 @@ def test_apply_next_osc():
                 region.ways_table,
                 region.relations_table,
             )
-            seq_after = get_last_applied_sequence(spark, region.osc_archive)
+            seq_after = get_min_applied_sequence(
+                spark, region.nodes_table, region.ways_table, region.relations_table,
+            )
 
         # Assert that the OSC archive received a partition for this sequence,
         # and that the row count matches the OSC's record count.

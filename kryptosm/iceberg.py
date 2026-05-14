@@ -116,6 +116,53 @@ class TableConfig:
         return ",\n            ".join(lines)
 
 
+@dataclass
+class KryptonDatabase:
+    """Derives all Krypton table names from a catalog + database pair.
+
+    Eliminates the repeated ``f"{CATALOG}.{DB_NAME}.nodes"`` pattern and
+    guarantees the table-name set stays consistent across scripts.
+    """
+
+    catalog: str
+    db_name: str
+
+    def _fqn(self, table: str) -> str:
+        return f"{self.catalog}.{self.db_name}.{table}"
+
+    @property
+    def nodes(self) -> str:
+        return self._fqn("nodes")
+
+    @property
+    def ways(self) -> str:
+        return self._fqn("ways")
+
+    @property
+    def relations(self) -> str:
+        return self._fqn("relations")
+
+    @property
+    def node_to_ways(self) -> str:
+        return self._fqn("node_to_ways")
+
+    @property
+    def way_to_relations(self) -> str:
+        return self._fqn("way_to_relations")
+
+    @property
+    def node_to_relations(self) -> str:
+        return self._fqn("node_to_relations")
+
+    @property
+    def relation_to_relations(self) -> str:
+        return self._fqn("relation_to_relations")
+
+    @property
+    def osc_archive(self) -> str:
+        return self._fqn("osc_changes")
+
+
 def table_exists(spark: SparkSession, table_name: str) -> bool:
     """Return True if the Iceberg table exists."""
     try:
@@ -592,28 +639,63 @@ def get_table_max_timestamp(
 
 
 # ---------------------------------------------------------------------------
-# Sequence stamping — lives on the OSC archive table.
+# Sequence stamping — every per-type table and the archive carry their own
+# stamp so a partially-completed OSC apply can be resumed.
+#
+# Properties:
+#   * ``last-applied-osc-sequence`` — on each per-type table; means
+#     "this table has been brought to the state implied by applying every
+#     OSC up to and including this sequence."
+#   * ``last-archived-osc-sequence`` — on the archive table; means "every
+#     OSC up to and including this sequence has had its records appended
+#     to the archive partition."
+#   * ``current-osc-file`` — on the archive table; the OSC file being
+#     applied right now (cleared / overwritten by the next apply).
+#
+# Database-level "current at N" = MIN of last-applied across nodes/ways/
+# relations. If they disagree, an apply was interrupted; the next call to
+# ``apply_osc`` will pick up where it left off and only re-do the missing
+# per-type sections.
 # ---------------------------------------------------------------------------
 
 _OSC_SEQ_PROPERTY = "last-applied-osc-sequence"
+_OSC_ARCHIVED_PROPERTY = "last-archived-osc-sequence"
 _OSC_FILE_PROPERTY = "current-osc-file"
 
 
-def get_last_applied_sequence(spark: SparkSession, archive_table: str) -> Optional[int]:
-    """Return the last-applied OSC sequence number on the archive table, or None."""
-    rows = spark.sql(f"SHOW TBLPROPERTIES {archive_table} ('{_OSC_SEQ_PROPERTY}')").collect()
+def _read_seq_property(spark: SparkSession, table_name: str, prop: str) -> Optional[int]:
+    """Read an integer-valued table property. Returns None if not set."""
+    rows = spark.sql(f"SHOW TBLPROPERTIES {table_name} ('{prop}')").collect()
     if not rows:
         return None
     value = rows[0][1]
+    # Spark returns `Table {table} does not have property: {prop}` when unset.
     if value.startswith("Table"):
         return None
     return int(value)
 
 
-def set_last_applied_sequence(spark: SparkSession, archive_table: str, seq: int) -> None:
-    """Stamp the archive table with the last-applied OSC sequence number."""
+def get_last_applied_sequence(spark: SparkSession, table_name: str) -> Optional[int]:
+    """Return the ``last-applied-osc-sequence`` on any per-type table, or None."""
+    return _read_seq_property(spark, table_name, _OSC_SEQ_PROPERTY)
+
+
+def set_last_applied_sequence(spark: SparkSession, table_name: str, seq: int) -> None:
+    """Stamp a per-type table with the last-applied OSC sequence number."""
     spark.sql(
-        f"ALTER TABLE {archive_table} SET TBLPROPERTIES ('{_OSC_SEQ_PROPERTY}' = '{seq}')"
+        f"ALTER TABLE {table_name} SET TBLPROPERTIES ('{_OSC_SEQ_PROPERTY}' = '{seq}')"
+    )
+
+
+def get_last_archived_sequence(spark: SparkSession, archive_table: str) -> Optional[int]:
+    """Return the ``last-archived-osc-sequence`` on the archive table, or None."""
+    return _read_seq_property(spark, archive_table, _OSC_ARCHIVED_PROPERTY)
+
+
+def set_last_archived_sequence(spark: SparkSession, archive_table: str, seq: int) -> None:
+    """Stamp the archive table with the highest sequence whose records are archived."""
+    spark.sql(
+        f"ALTER TABLE {archive_table} SET TBLPROPERTIES ('{_OSC_ARCHIVED_PROPERTY}' = '{seq}')"
     )
 
 
@@ -622,6 +704,26 @@ def set_current_osc_file(spark: SparkSession, archive_table: str, filename: str)
     spark.sql(
         f"ALTER TABLE {archive_table} SET TBLPROPERTIES ('{_OSC_FILE_PROPERTY}' = '{filename}')"
     )
+
+
+def get_min_applied_sequence(
+    spark: SparkSession,
+    nodes_table: str,
+    ways_table: str,
+    relations_table: str,
+) -> Optional[int]:
+    """Database-wide last-applied = MIN across the three per-type tables.
+
+    If any per-type table has never had an OSC applied (property is None),
+    returns None — the caller falls back to estimating from MAX(timestamp).
+    """
+    seqs = [
+        get_last_applied_sequence(spark, t)
+        for t in (nodes_table, ways_table, relations_table)
+    ]
+    if any(s is None for s in seqs):
+        return None
+    return min(s for s in seqs if s is not None)
 
 
 # ---------------------------------------------------------------------------

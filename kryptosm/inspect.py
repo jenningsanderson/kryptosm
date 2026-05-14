@@ -38,6 +38,111 @@ def list_snapshots(spark: SparkSession, table_name: str) -> List[dict]:
     return [row.asDict() for row in rows]
 
 
+# ---------------------------------------------------------------------------
+# Per-feature history across snapshots ("did this id ever actually change?")
+# ---------------------------------------------------------------------------
+
+
+def feature_history(
+    spark: SparkSession,
+    table_name: str,
+    feature_id: int,
+) -> List[dict]:
+    """Walk every snapshot of a per-type table and return the transitions
+    for a single feature.
+
+    Useful for time-travel debugging: confirms whether the row was actually
+    rewritten across snapshots and surfaces every distinct state the
+    feature held over the table's history.
+
+    Output: one dict per *transition* in snapshot order. A transition is a
+    snapshot whose row state for ``feature_id`` differs from the prior
+    snapshot (including absent \u2194 present). The first snapshot always
+    emits one entry.
+
+    Each dict carries: ``snap_seq``, ``snapshot_id``, ``committed_at``,
+    ``present``, ``version``, ``timestamp``, ``changeset``, ``latest_ts``.
+    Row fields are ``None`` when ``present`` is False (feature absent /
+    deleted at that snapshot).
+    """
+    snapshots = list_snapshots(spark, table_name)
+    if not snapshots:
+        return []
+
+    # One Spark query fans out across every snapshot via UNION ALL. Each
+    # branch reads via VERSION AS OF and filters by id; bloom filters on
+    # `id` make the per-branch scan cheap.
+    union_sql = "\n        UNION ALL\n        ".join(
+        f"""SELECT {i} AS snap_seq,
+                   version, timestamp, changeset, latest_ts
+            FROM {table_name} VERSION AS OF {s['snapshot_id']}
+            WHERE id = {feature_id}"""
+        for i, s in enumerate(snapshots, start=1)
+    )
+    rows = spark.sql(f"{union_sql}\n        ORDER BY snap_seq").collect()
+    by_seq = {r["snap_seq"]: r for r in rows}
+
+    history: List[dict] = []
+    sentinel = object()
+    prior_state = sentinel
+    for i, snap in enumerate(snapshots, start=1):
+        r = by_seq.get(i)
+        state = (
+            (r["version"], r["timestamp"], r["changeset"], r["latest_ts"])
+            if r is not None else None
+        )
+        if state == prior_state:
+            continue
+        prior_state = state
+        history.append({
+            "snap_seq":     i,
+            "snapshot_id":  snap["snapshot_id"],
+            "committed_at": snap["committed_at"],
+            "present":      r is not None,
+            "version":      r["version"]   if r else None,
+            "timestamp":    r["timestamp"] if r else None,
+            "changeset":    r["changeset"] if r else None,
+            "latest_ts":    r["latest_ts"] if r else None,
+        })
+    return history
+
+
+def format_feature_history(history: List[dict], feature_id: int) -> str:
+    """Render :func:`feature_history` output as a fixed-width table string."""
+    if not history:
+        return f"No history for id={feature_id} (table has no snapshots)."
+
+    header = ["snap", "snapshot_id", "committed_at",
+              "version", "timestamp", "changeset", "latest_ts"]
+    rendered: List[List[str]] = [header]
+    for h in history:
+        if not h["present"]:
+            rendered.append([
+                str(h["snap_seq"]), str(h["snapshot_id"]),
+                str(h["committed_at"]),
+                "(absent)", "", "", "",
+            ])
+        else:
+            rendered.append([
+                str(h["snap_seq"]), str(h["snapshot_id"]),
+                str(h["committed_at"]),
+                str(h["version"]), str(h["timestamp"]),
+                "" if h["changeset"] is None else str(h["changeset"]),
+                str(h["latest_ts"]),
+            ])
+
+    widths = [max(len(row[i]) for row in rendered) for i in range(len(header))]
+    fmt = "  ".join("{:<" + str(w) + "}" for w in widths)
+    lines = [
+        f"History for id={feature_id} ({len(history)} transition"
+        f"{'' if len(history) == 1 else 's'}):",
+        fmt.format(*rendered[0]),
+        fmt.format(*("-" * w for w in widths)),
+        *(fmt.format(*row) for row in rendered[1:]),
+    ]
+    return "\n".join(lines)
+
+
 def _find_osc_boundaries(snapshots: List[dict]) -> List[Tuple[int, int]]:
     """Identify pairs of snapshots that bracket complete OSC applies.
 

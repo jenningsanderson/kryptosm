@@ -7,9 +7,9 @@ Set KRYPTOSM_REGION=oregon to use Oregon data (default: dc).
 
 from kryptosm import (
     TableConfig,
-    build_linestring_for_ways,
+    build_way_linestrings,
     build_node_geometry,
-    build_ways_geometry_from_linestring,
+    promote_closed_ways_to_areas,
     construct_multipolygon,
     create_index_tables,
     create_nodes_table,
@@ -94,8 +94,8 @@ def test_init():
             load_with_geom(spark, region.nodes_table, "nodes_with_geom")
 
         with stage("Build + write ways"):
-            build_linestring_for_ways(spark, "input_ways", "nodes_with_geom", "ways_linestrings")
-            build_ways_geometry_from_linestring(spark, "ways_linestrings", "ways_with_geom")
+            build_way_linestrings(spark, "input_ways", "nodes_with_geom", "ways_linestrings")
+            promote_closed_ways_to_areas(spark, "ways_linestrings", "ways_with_geom")
             prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final")
             spark.sql("SELECT * FROM ways_final") \
                 .repartitionByRange(10, col("id")) \
@@ -106,16 +106,44 @@ def test_init():
             populate_node_to_ways(spark, region.ways_table, region.node_to_ways)
 
         with stage("Build + write relations"):
+            spark.sql("""
+                SELECT DISTINCT member.ref AS id
+                FROM (SELECT explode(members) AS member FROM input_relations)
+                WHERE member.type = 'way'
+            """).createOrReplaceTempView("_rel_way_ids")
+            ways_for_rels = spark.sql("""
+                SELECT w.*
+                FROM ways_with_geom w
+                JOIN _rel_way_ids r ON w.id = r.id
+            """).persist()
+            ways_for_rels.createOrReplaceTempView("ways_for_relations")
+
+            spark.sql("""
+                SELECT DISTINCT member.ref AS id
+                FROM (SELECT explode(members) AS member FROM input_relations)
+                WHERE member.type = 'node'
+            """).createOrReplaceTempView("_rel_node_ids")
+            nodes_for_rels = spark.sql("""
+                SELECT n.*
+                FROM nodes_with_geom n
+                JOIN _rel_node_ids r ON n.id = r.id
+            """).persist()
+            nodes_for_rels.createOrReplaceTempView("nodes_for_relations")
+
             relations_need_geometry(spark, "input_relations", "relations_need_geom")
-            construct_multipolygon(spark, "relations_need_geom", "ways_with_geom", "relations_geom",
-                                   nodes_geometry="nodes_with_geom")
+            construct_multipolygon(spark, "relations_need_geom", "ways_for_relations", "relations_geom",
+                                   nodes_geometry="nodes_for_relations")
             relation_merge_geometry_data(
                 spark, "input_relations", "relations_geom", "relations_with_geom",
-                ways_geometry="ways_with_geom", nodes_geometry="nodes_with_geom",
+                ways_geometry="ways_for_relations", nodes_geometry="nodes_for_relations",
             )
             prepare_for_iceberg(spark, "relations_with_geom", "relation", "relations_final")
             spark.sql("SELECT * FROM relations_final") \
+                .repartitionByRange(20, col("id")) \
                 .writeTo(region.relations_table).using("iceberg").append()
+
+            ways_for_rels.unpersist()
+            nodes_for_rels.unpersist()
 
         with stage("Populate way_to_relations index"):
             populate_way_to_relations(spark, region.relations_table, region.way_to_relations)

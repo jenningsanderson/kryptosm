@@ -49,7 +49,7 @@ def _area_tag_predicate() -> str:
     )
 
 
-def build_linestring_for_ways(
+def build_way_linestrings(
     spark: SparkSession, ways_data: str, nodes_geometry: str, result_view: str
 ):
     """
@@ -129,7 +129,7 @@ def flatten_way_refs(spark: SparkSession, raw_ways: str, result_view: str):
     """).createOrReplaceTempView(result_view)
 
 
-def build_ways_geometry_from_linestring(
+def promote_closed_ways_to_areas(
     spark: SparkSession, ways_linestrings: str, result_view: str
 ):
     """

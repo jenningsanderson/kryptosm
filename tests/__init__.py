@@ -6,6 +6,7 @@ Set KRYPTOSM_REGION=oregon to test with Oregon data (default: dc).
 
 import logging
 import os
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -85,6 +86,7 @@ REGIONS = {
         short_name="dc",
         parquet_path=_DATA_DIR / "WashingtonDC" / "dc.parquet",
         replication_url="https://download.geofabrik.de/north-america/us/district-of-columbia-updates/",
+        driver_memory="4g",
     ),
     "oregon": Region(
         short_name="oregon",
@@ -171,5 +173,7 @@ def configure_logging():
     """Enable kryptosm log output for tests."""
     logging.basicConfig(
         level=logging.INFO,
-        format="%(name)s: %(message)s",
+        format="  %(name)s: %(message)s",
+        stream=sys.stdout,
+        force=True,
     )
