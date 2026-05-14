@@ -107,26 +107,45 @@ def osc_dedup(spark: SparkSession, osc_view: str, result_view: str):
 # ---------------------------------------------------------------------------
 
 
-def _fetch_xml(file_path: str) -> bytes:
-    """Return raw OSC XML bytes from a local file."""
+def _iter_osc_records(file_path: str):
+    """Stream OSC XML, yielding one record per element.
+
+    Uses ``iterparse`` + ``elem.clear()`` so peak memory is O(1) in the size
+    of the document — only the currently-being-parsed element is resident.
+    Daily-planet OSCs can decompress to multiple GB; the previous
+    ``ElementTree.fromstring`` approach materialized the whole DOM in driver
+    memory and triggered ``Parse error: out of memory`` on Glue.
+    """
     if file_path.startswith("s3://"):
         raise NotImplementedError("S3 OSC files not yet implemented")
+
+    # Open the gz directly as a stream — never read the full payload into bytes.
     try:
-        with gzip.GzipFile(file_path, "rb") as f:
-            return f.read()
+        stream = gzip.open(file_path, "rb")
     except OSError:
-        with open(file_path, "rb") as f:
-            return f.read()
+        stream = open(file_path, "rb")
 
+    try:
+        current_op: Optional[str] = None
+        for event, element in ElementTree.iterparse(stream, events=("start", "end")):
+            tag = element.tag
+            if event == "start":
+                if tag in ("create", "modify", "delete"):
+                    current_op = tag
+                continue
 
-def _parse_osc(xml_bytes: bytes) -> list:
-    """Flatten OSC XML into a list of records (one row per change)."""
-    records = []
-    for action in ElementTree.fromstring(xml_bytes):
-        op = action.tag
-        for element in action:
-            elem_type = element.tag
-            tags, refs, members = {}, None, None
+            # event == "end"
+            if tag in ("create", "modify", "delete"):
+                # Action done — free it; children were already freed below.
+                element.clear()
+                continue
+
+            if tag not in ("node", "way", "relation") or current_op is None:
+                continue
+
+            tags: dict = {}
+            refs: Optional[list] = None
+            members: Optional[list] = None
             for child in element:
                 if child.tag == "tag":
                     tags[child.attrib["k"]] = child.attrib["v"]
@@ -142,32 +161,39 @@ def _parse_osc(xml_bytes: bytes) -> list:
                             "role": child.attrib.get("role", ""),
                         }
                     )
+
             ts = element.attrib["timestamp"]
-            records.append(
-                {
-                    "id": int(element.attrib["id"]),
-                    "type": elem_type,
-                    "op": op,
-                    "version": int(element.attrib["version"]),
-                    "timestamp": ts,
-                    "uid": int(element.attrib.get("uid", 0)),
-                    "user": element.attrib.get("user", ""),
-                    "changeset": int(element.attrib.get("changeset", 0)),
-                    "tags": tags,
-                    "lat": float(element.attrib["lat"]) if elem_type == "node" else None,
-                    "lon": float(element.attrib["lon"]) if elem_type == "node" else None,
-                    "refs": refs,
-                    "members": members,
-                    "latest_ts": ts,
-                }
-            )
-    return records
+            yield {
+                "id": int(element.attrib["id"]),
+                "type": tag,
+                "op": current_op,
+                "version": int(element.attrib["version"]),
+                "timestamp": ts,
+                "uid": int(element.attrib.get("uid", 0)),
+                "user": element.attrib.get("user", ""),
+                "changeset": int(element.attrib.get("changeset", 0)),
+                "tags": tags,
+                "lat": float(element.attrib["lat"]) if tag == "node" else None,
+                "lon": float(element.attrib["lon"]) if tag == "node" else None,
+                "refs": refs,
+                "members": members,
+                "latest_ts": ts,
+            }
+            # Free this element so iterparse doesn't accumulate the document.
+            element.clear()
+    finally:
+        stream.close()
 
 
 def read_osc_from_file(spark: SparkSession, file_path: str) -> DataFrame:
-    """Read a local .osc or .osc.gz (or plain XML) into a DataFrame."""
+    """Read a local .osc or .osc.gz (or plain XML) into a DataFrame.
+
+    Streams the XML through ``_iter_osc_records`` so the peak driver memory
+    is bounded by the materialized record list (one Python dict per change),
+    not by the parsed XML DOM.
+    """
     return spark.createDataFrame(
-        _parse_osc(_fetch_xml(file_path)),
+        list(_iter_osc_records(file_path)),
         OSC_SCHEMA,
     )
 

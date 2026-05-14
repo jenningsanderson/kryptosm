@@ -44,12 +44,21 @@ Each row is one parameter (a `Key` + a `Value`). Add these one row at a time:
 | Key                           | Value                                                                                                                |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `--datalake-formats`          | `iceberg`                                                                                                            |
-| `--additional-python-modules` | `apache-sedona==1.9.0,kryptosm`                                                                                      |
+| `--additional-python-modules` | `apache-sedona==1.9.0,kryptosm,urllib3==1.26.20`                                                                     |
 | `--extra-jars`                | `s3://YOUR-BUCKET/jars/sedona-spark-shaded-3.5_2.12-1.9.0.jar,s3://YOUR-BUCKET/jars/geotools-wrapper-1.7.0-28.5.jar` |
 | `--conf`                      | _(see below)_                                                                                                        |
 
 Pin the Sedona Python wheel and the shaded JAR to the **same** version (and
 make sure that version's the one you uploaded to S3).
+
+> ℹ️ **Why the `urllib3>=1.26.0` pin?** `pyosmium`'s `ReplicationServer`
+> (which we use to fetch OSC files) builds a `requests.Session` with
+> `Retry(allowed_methods=...)`. The `allowed_methods` keyword was renamed
+> from `method_whitelist` in **urllib3 1.26** (Nov 2020). Glue 5.0 ships an
+> older urllib3 in its base image (pinned to keep botocore happy), and
+> without this override `glue_apply_osc.py` crashes with
+> `TypeError: Retry.__init__() got an unexpected keyword argument 'allowed_methods'`
+> the first time it tries to fetch a replication state file.
 
 ### The single `--conf` value
 
