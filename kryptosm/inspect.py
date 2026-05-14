@@ -75,13 +75,14 @@ def _find_osc_boundaries(snapshots: List[dict]) -> List[Tuple[int, int]]:
 def diff_snapshots(
     spark: SparkSession,
     table_name: str,
+    osm_type: str,
     snap_before: int,
     snap_after: int,
 ) -> list:
-    """Find features that changed between two snapshots.
+    """Find features that changed between two snapshots of a per-type table.
 
-    Full outer join on (id, type) — only collects rows where the version
-    differs, so the result set is small even for large tables.
+    ``osm_type`` ('node' / 'way' / 'relation') is baked into the diff rows
+    as a literal so downstream GeoJSON consumers can still see the type.
     """
     spark.sql(f"""
         SELECT * FROM {table_name} VERSION AS OF {snap_before}
@@ -91,10 +92,10 @@ def diff_snapshots(
         SELECT * FROM {table_name} VERSION AS OF {snap_after}
     """).createOrReplaceTempView("_snap_after")
 
-    return spark.sql("""
+    return spark.sql(f"""
         SELECT
             COALESCE(a.id, b.id)     AS id,
-            COALESCE(a.type, b.type) AS type,
+            CAST('{osm_type}' AS STRING) AS type,
             CASE
                 WHEN b.id IS NULL THEN 'added'
                 WHEN a.id IS NULL THEN 'deleted'
@@ -115,7 +116,7 @@ def diff_snapshots(
             a.timestamp  AS ts_after,
             b.timestamp  AS ts_before
         FROM      _snap_after  a
-        FULL OUTER JOIN _snap_before b ON a.id = b.id AND a.type = b.type
+        FULL OUTER JOIN _snap_before b ON a.id = b.id
         WHERE b.id IS NULL
            OR a.id IS NULL
            OR a.version != b.version
@@ -510,14 +511,19 @@ def _count_features(geojson: dict) -> dict:
 def inspect_snapshots(
     spark: SparkSession,
     table_name: str,
+    osm_type: str,
     output_dir: str,
     snap_before: Optional[int] = None,
     snap_after: Optional[int] = None,
 ) -> List[str]:
     """Generate GeoJSON diffs and a combined HTML timeline viewer.
 
-    With no arguments, compares init-end to the current state (all OSC
-    changes in one diff). For per-OSC diffs, call after each ``apply_osc``.
+    With no snapshot args, compares init-end to the current state of the
+    given per-type table (all OSC changes for that type in one diff). For
+    per-OSC diffs, call after each ``apply_osc``.
+
+    ``osm_type`` ('node' / 'way' / 'relation') is the type carried in this
+    table; it's baked into the GeoJSON properties as ``@type``.
 
     Returns a list of generated file paths.
     """
@@ -529,7 +535,7 @@ def inspect_snapshots(
     else:
         pairs = _find_osc_boundaries(snapshots)
         if not pairs:
-            logger.info("No OSC updates applied yet — nothing to diff.")
+            logger.info("No OSC updates applied yet \u2014 nothing to diff.")
             return []
 
     all_features: List[dict] = []
@@ -540,8 +546,8 @@ def inspect_snapshots(
         after_snap = snap_map.get(after_id, {})
         committed_at = str(after_snap.get("committed_at", ""))
 
-        logger.info("Diffing snapshot %s → %s ...", before_id, after_id)
-        rows = diff_snapshots(spark, table_name, before_id, after_id)
+        logger.info("Diffing snapshot %s \u2192 %s ...", before_id, after_id)
+        rows = diff_snapshots(spark, table_name, osm_type, before_id, after_id)
         if not rows:
             logger.info("  No changes.")
             continue
@@ -552,13 +558,13 @@ def inspect_snapshots(
         )
         counts = _count_features(geojson)
 
-        stem = f"diff_{before_id}_{after_id}"
+        stem = f"diff_{osm_type}_{before_id}_{after_id}"
         gj_path = os.path.join(output_dir, f"{stem}.geojson")
         write_geojson(geojson, gj_path)
         paths.append(gj_path)
 
         logger.info(
-            "  %d+ %d~ %d- (%d geometry changes) → %s",
+            "  %d+ %d~ %d- (%d geometry changes) \u2192 %s",
             counts['added'], counts['modified'], counts['deleted'],
             counts['geometry'], gj_path,
         )
@@ -572,7 +578,7 @@ def inspect_snapshots(
 
     if steps:
         combined = {"type": "FeatureCollection", "features": all_features}
-        html_path = os.path.join(output_dir, "inspector.html")
+        html_path = os.path.join(output_dir, f"inspector_{osm_type}.html")
         write_html_viewer(combined, steps, html_path)
         paths.append(html_path)
         logger.info("Timeline viewer (%d steps): %s", len(steps), html_path)

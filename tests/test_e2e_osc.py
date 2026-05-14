@@ -28,7 +28,8 @@ def test_apply_next_osc():
     print(f"\n{'=' * 70}")
     print(f"APPLY NEXT OSC — {region.db_name}")
     print(f"{'=' * 70}")
-    print(f"Table: {region.table_name}\n")
+    print(f"Nodes:       {region.nodes_table}")
+    print(f"OSC archive: {region.osc_archive}\n")
 
     with stage("Spark session"):
         spark = create_spark_session_for_testing(
@@ -38,17 +39,28 @@ def test_apply_next_osc():
         )
 
     try:
-        assert table_exists(spark, region.table_name), \
-            f"{region.table_name} does not exist. Run `make test-e2e-init` first."
+        for tbl in (region.nodes_table, region.ways_table, region.relations_table):
+            assert table_exists(spark, tbl), \
+                f"{tbl} does not exist. Run `make test-e2e-init` first."
 
         with stage("Counts BEFORE"):
-            before = get_table_count(spark, region.table_name)
-            seq_before = get_last_applied_sequence(spark, region.table_name)
+            before = get_table_count(
+                spark,
+                region.nodes_table,
+                region.ways_table,
+                region.relations_table,
+            )
+            seq_before = get_last_applied_sequence(spark, region.osc_archive)
             print(f"  sequence: {seq_before}")
 
         with stage("Fetch next OSC"):
             osc_path = next_osc_path(
-                spark, region.table_name, str(region.osc_dir),
+                spark,
+                region.nodes_table,
+                region.ways_table,
+                region.relations_table,
+                region.osc_archive,
+                str(region.osc_dir),
                 base_url=region.replication_url,
             )
 
@@ -59,12 +71,34 @@ def test_apply_next_osc():
         print(f"  {os.path.basename(osc_path)}  ({os.path.getsize(osc_path):,} bytes)")
 
         with stage(f"Apply {os.path.basename(osc_path)}"):
-            apply_osc(spark, region.table_name, osc_path,
-                      region.node_to_ways, region.way_to_relations)
+            apply_osc(
+                spark, osc_path,
+                region.nodes_table, region.ways_table, region.relations_table,
+                region.node_to_ways, region.way_to_relations,
+                region.node_to_relations, region.relation_to_relations,
+                region.osc_archive,
+            )
 
         with stage("Counts AFTER"):
-            after = get_table_count(spark, region.table_name)
-            seq_after = get_last_applied_sequence(spark, region.table_name)
+            after = get_table_count(
+                spark,
+                region.nodes_table,
+                region.ways_table,
+                region.relations_table,
+            )
+            seq_after = get_last_applied_sequence(spark, region.osc_archive)
+
+        # Assert that the OSC archive received a partition for this sequence,
+        # and that the row count matches the OSC's record count.
+        if seq_after is not None:
+            n_archive = spark.sql(f"""
+                SELECT COUNT(*) AS n FROM {region.osc_archive}
+                WHERE sequence = {seq_after}
+            """).collect()[0]["n"]
+            print(f"  archive rows for sequence {seq_after}: {n_archive:,}")
+            assert n_archive > 0, (
+                f"Expected osc_archive to contain rows for sequence {seq_after}"
+            )
 
         print("=" * 70)
         for osm_type in ("node", "way", "relation"):

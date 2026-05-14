@@ -1,7 +1,8 @@
 # kryptosm
 
-Turn OpenStreetMap data into a single Apache Iceberg table, kept up to date
-with incremental OSC change files.
+Turn OpenStreetMap data into the **Krypton** Iceberg database — three
+per-type tables (`nodes`, `ways`, `relations`) plus reverse-index and
+OSC-archive tables — kept up to date with incremental OSC change files.
 
 Built on PySpark + Apache Sedona for geometry construction and Apache Iceberg
 for versioned, time-travel-capable table storage.
@@ -10,17 +11,17 @@ for versioned, time-travel-capable table storage.
 
 1. **Initial load** — reads an OSM Parquet extract (nodes, ways, relations),
    builds geometries with Sedona SQL functions (`ST_Point`, `ST_LineString`,
-   `ST_Polygon`, `ST_MultiPolygon`), and writes everything to a single
-   Iceberg table partitioned by `type`.
+   `ST_Polygon`, `ST_MultiPolygon`), and writes each type to its own Iceberg
+   table with type-specific tuning (bloom filters, sort orders, distribution).
 
-2. **Incremental update** — fetches OSC change files from a Geofabrik
-   replication feed, computes the dependency-aware "dirty set" (if a node
-   moves, every way referencing it and every relation referencing those ways
-   gets its geometry rebuilt), and MERGEs the changes into the table. Each
-   OSC file produces its own Iceberg snapshot, so the table's history steps
-   through every change.
+2. **Incremental update** — fetches OSC change files from a replication feed,
+   computes the dependency-aware "dirty set" (if a node moves, every way
+   referencing it and every relation referencing those ways or that node
+   gets its geometry rebuilt), and MERGEs the changes into the relevant
+   per-type tables. Each OSC file produces its own Iceberg snapshot per
+   table, so each table's history steps through every change.
 
-3. **Inspection** — compares Iceberg snapshots to produce GeoJSON +
+3. **Inspection** — compares Iceberg snapshots per table to produce GeoJSON +
    interactive HTML maps showing what changed: geometry diffs, tag diffs,
    added/modified/deleted features with `@valid_since` / `@valid_until`
    timestamps.
@@ -33,7 +34,7 @@ for versioned, time-travel-capable table storage.
 
 - **No CLI.** This is a library. The caller owns the Spark session — a
   cloud deployment (EMR, Glue, Databricks) provides its own. The E2E tests
-  *are* the sample scripts; a production cron job looks nearly identical.
+  _are_ the sample scripts; a production cron job looks nearly identical.
 
 - **Atomic, one-at-a-time updates.** Each OSC file is fetched and applied
   independently. `next_osc_path` returns the next pending file (downloading
@@ -55,32 +56,78 @@ for versioned, time-travel-capable table storage.
 - **Delete what's unused.** No backwards compatibility shims, no
   deprecation layers. If something is wrong, fix it.
 
-## Table schema
+## Database schema
 
-One table, partitioned by `type` (`node` | `way` | `relation`):
+Krypton is a per-type Iceberg layout. Each table has its own bloom-filter
+budget, sort order, and compaction cadence — tuned to its row count and
+shape.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | `BIGINT` | OSM element ID |
-| `type` | `STRING` | Partition key |
-| `version` | `BIGINT` | OSM version number |
-| `timestamp` | `TIMESTAMP` | Last edit timestamp |
-| `changeset` | `BIGINT` | OSM changeset ID |
-| `uid` | `BIGINT` | Editor user ID |
-| `user` | `STRING` | Editor username |
-| `tags` | `MAP<STRING, STRING>` | Key-value tag pairs |
-| `lat` | `DOUBLE` | Latitude (nodes only) |
-| `lon` | `DOUBLE` | Longitude (nodes only) |
-| `refs` | `ARRAY<BIGINT>` | Ordered node references (ways only) |
-| `members` | `ARRAY<STRUCT<type, ref, role>>` | Member references (relations only) |
-| `latest_ts` | `TIMESTAMP` | Max timestamp across feature + dependencies |
-| `geometry` | `BINARY` | WKB-encoded geometry |
-| `bbox` | `STRUCT<xmin, xmax, ymin, ymax: FLOAT>` | Bounding box |
+### `nodes` table
 
-Two sibling index tables in the same database:
+| Column                  | Type                  | Description                         |
+| ----------------------- | --------------------- | ----------------------------------- |
+| `id`                    | `BIGINT`              | OSM node ID                         |
+| `version`               | `BIGINT`              | OSM version number                  |
+| `timestamp`             | `TIMESTAMP`           | Last edit timestamp                 |
+| `changeset`             | `BIGINT`              | OSM changeset ID                    |
+| `uid`                   | `BIGINT`              | Editor user ID                      |
+| `user`                  | `STRING`              | Editor username                     |
+| `tags`                  | `MAP<STRING, STRING>` | Key-value tag pairs                 |
+| `lat`                   | `DOUBLE`              | Latitude                            |
+| `lon`                   | `DOUBLE`              | Longitude                           |
+| `latest_ts`             | `TIMESTAMP`           | Max timestamp across self           |
+| `additional_changesets` | `ARRAY<BIGINT>`       | Always `[]` for nodes (no children) |
+| `geometry`              | `BINARY`              | WKB-encoded ST_Point                |
+
+No `bbox` — lat/lon already define a node's footprint.
+
+### `ways` table
+
+| Column                  | Type                                    | Description                                            |
+| ----------------------- | --------------------------------------- | ------------------------------------------------------ |
+| `id`                    | `BIGINT`                                | OSM way ID                                             |
+| `version`               | `BIGINT`                                | OSM version number                                     |
+| `timestamp`             | `TIMESTAMP`                             | Last edit timestamp                                    |
+| `changeset`             | `BIGINT`                                | OSM changeset ID                                       |
+| `uid`                   | `BIGINT`                                | Editor user ID                                         |
+| `user`                  | `STRING`                                | Editor username                                        |
+| `tags`                  | `MAP<STRING, STRING>`                   | Key-value tag pairs                                    |
+| `refs`                  | `ARRAY<BIGINT>`                         | Ordered node references                                |
+| `latest_ts`             | `TIMESTAMP`                             | Max timestamp across self + member nodes               |
+| `additional_changesets` | `ARRAY<BIGINT>`                         | Member-node changesets strictly newer than `changeset` |
+| `geometry`              | `BINARY`                                | WKB-encoded LineString or Polygon                      |
+| `bbox`                  | `STRUCT<xmin, xmax, ymin, ymax: FLOAT>` | Bounding box                                           |
+
+### `relations` table
+
+| Column                  | Type                                    | Description                                                  |
+| ----------------------- | --------------------------------------- | ------------------------------------------------------------ |
+| `id`                    | `BIGINT`                                | OSM relation ID                                              |
+| `version`               | `BIGINT`                                | OSM version number                                           |
+| `timestamp`             | `TIMESTAMP`                             | Last edit timestamp                                          |
+| `changeset`             | `BIGINT`                                | OSM changeset ID                                             |
+| `uid`                   | `BIGINT`                                | Editor user ID                                               |
+| `user`                  | `STRING`                                | Editor username                                              |
+| `tags`                  | `MAP<STRING, STRING>`                   | Key-value tag pairs                                          |
+| `members`               | `ARRAY<STRUCT<type, ref, role>>`        | Member references                                            |
+| `latest_ts`             | `TIMESTAMP`                             | Max timestamp across self + members                          |
+| `additional_changesets` | `ARRAY<BIGINT>`                         | Member-way / member-node changesets strictly newer than self |
+| `geometry`              | `BINARY`                                | WKB-encoded MultiPolygon / MultiLineString / Collection      |
+| `bbox`                  | `STRUCT<xmin, xmax, ymin, ymax: FLOAT>` | Bounding box                                                 |
+
+### Index tables
 
 - **`node_to_ways`** (`node_id`, `way_id`) — which ways reference each node
 - **`way_to_relations`** (`way_id`, `relation_id`) — which relations reference each way
+- **`node_to_relations`** (`node_id`, `relation_id`) — which relations reference each node directly
+- **`relation_to_relations`** (`child_relation_id`, `parent_relation_id`) — sub-relation membership edges
+
+### OSC archive
+
+- **`osc_changes`** — one row per OSC change record, partitioned by `sequence`.
+  Also holds the `last-applied-osc-sequence` and `current-osc-file` table
+  properties (the single source of truth for "where in the replication feed
+  are we?").
 
 ## How it works
 
@@ -92,12 +139,21 @@ from kryptosm import *
 # Caller provides the Spark session (cloud or local).
 spark = ...
 
-TABLE = "hadoop_catalog.dc.osm"
-N2W   = "hadoop_catalog.dc.node_to_ways"
-W2R   = "hadoop_catalog.dc.way_to_relations"
+DB         = "glue_catalog.kryptosm"
+NODES      = f"{DB}.nodes"
+WAYS       = f"{DB}.ways"
+RELATIONS  = f"{DB}.relations"
+N2W        = f"{DB}.node_to_ways"
+W2R        = f"{DB}.way_to_relations"
+N2R        = f"{DB}.node_to_relations"
+R2R        = f"{DB}.relation_to_relations"
+ARCHIVE    = f"{DB}.osc_changes"
 
-create_iceberg_table(spark, TABLE)
-create_index_tables(spark, N2W, W2R)
+create_nodes_table(spark, NODES, config=TableConfig.nodes_production())
+create_ways_table(spark, WAYS, config=TableConfig.ways_production())
+create_relations_table(spark, RELATIONS, config=TableConfig.relations_production())
+create_index_tables(spark, N2W, W2R, node_to_relations=N2R, relation_to_relations=R2R)
+create_osc_archive_table(spark, ARCHIVE)
 
 # Read raw Parquet
 spark.read.parquet("s3://bucket/dc.parquet/type=node").createOrReplaceTempView("input_nodes")
@@ -108,45 +164,55 @@ spark.read.parquet("s3://bucket/dc.parquet/type=relation").createOrReplaceTempVi
 # Nodes
 build_node_geometry(spark, "input_nodes", "nodes_with_geom")
 prepare_for_iceberg(spark, "nodes_with_geom", "node", "nodes_final")
-spark.sql("SELECT * FROM nodes_final").writeTo(TABLE).using("iceberg").append()
-load_with_geom(spark, TABLE, "node", "nodes_with_geom")
+spark.sql("SELECT * FROM nodes_final").writeTo(NODES).using("iceberg").append()
+load_with_geom(spark, NODES, "nodes_with_geom")
 
 # Ways
 build_linestring_for_ways(spark, "input_ways", "nodes_with_geom", "ways_lines")
 build_ways_geometry_from_linestring(spark, "ways_lines", "ways_with_geom")
 prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final")
-spark.sql("SELECT * FROM ways_final").writeTo(TABLE).using("iceberg").append()
-load_with_geom(spark, TABLE, "way", "ways_with_geom")
-populate_node_to_ways(spark, TABLE, N2W)
+spark.sql("SELECT * FROM ways_final").writeTo(WAYS).using("iceberg").append()
+load_with_geom(spark, WAYS, "ways_with_geom")
+populate_node_to_ways(spark, WAYS, N2W)
 
 # Relations
 relations_need_geometry(spark, "input_relations", "rels_need_geom")
 construct_multipolygon(spark, "rels_need_geom", "ways_with_geom", "rels_geom")
 relation_merge_geometry_data(spark, "input_relations", "rels_geom", "rels_with_geom")
 prepare_for_iceberg(spark, "rels_with_geom", "relation", "rels_final")
-spark.sql("SELECT * FROM rels_final").writeTo(TABLE).using("iceberg").append()
-populate_way_to_relations(spark, TABLE, W2R)
+spark.sql("SELECT * FROM rels_final").writeTo(RELATIONS).using("iceberg").append()
+populate_way_to_relations(spark, RELATIONS, W2R)
+populate_node_to_relations(spark, RELATIONS, N2R)
+populate_relation_to_relations(spark, RELATIONS, R2R)
 ```
 
 ### Incremental update
 
 ```python
 # Apply the next pending OSC (fetch + apply are separate)
-path = next_osc_path(spark, TABLE, "/tmp/osc", base_url=GEOFABRIK_URL)
+path = next_osc_path(spark, NODES, WAYS, RELATIONS, ARCHIVE,
+                     "/tmp/osc", base_url=GEOFABRIK_URL)
 if path:
-    apply_osc(spark, TABLE, path, N2W, W2R)
+    apply_osc(spark, path,
+              NODES, WAYS, RELATIONS,
+              N2W, W2R, N2R, R2R,
+              ARCHIVE)
 
 # Or loop until current
-while path := next_osc_path(spark, TABLE, "/tmp/osc", base_url=GEOFABRIK_URL):
-    apply_osc(spark, TABLE, path, N2W, W2R)
+while path := next_osc_path(spark, NODES, WAYS, RELATIONS, ARCHIVE,
+                            "/tmp/osc", base_url=GEOFABRIK_URL):
+    apply_osc(spark, path,
+              NODES, WAYS, RELATIONS,
+              N2W, W2R, N2R, R2R,
+              ARCHIVE)
 ```
 
 ### Inspect changes
 
 ```python
-snapshots = list_snapshots(spark, TABLE)
-inspect_snapshots(spark, TABLE, "./output")
-# Produces .geojson files + inspector.html (MapLibre GL JS timeline viewer)
+# Inspect runs per per-type table.
+inspect_snapshots(spark, RELATIONS, "relation", "./output")
+# Produces .geojson files + inspector_relation.html (MapLibre GL JS timeline viewer)
 ```
 
 ## Repository layout
@@ -226,6 +292,7 @@ OSC XML → parse → dedup (latest version per id+type)
 - `requests>=2.28.0`
 
 JARs (auto-cached at `~/.cache/kryptosm/jars/`):
+
 - `sedona-spark-shaded-3.5_2.12-1.8.1.jar`
 - `iceberg-spark-runtime-3.5_2.12-1.6.1.jar`
 - `iceberg-aws-bundle-1.6.1.jar`

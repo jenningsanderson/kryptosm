@@ -15,12 +15,12 @@ from pyspark.sql import SparkSession
 
 _JAR_DIR = Path.home() / ".cache" / "kryptosm" / "jars"
 _JARS = (
-    "sedona-spark-shaded-3.5_2.12-1.8.1.jar",
+    "sedona-spark-shaded-3.5_2.12-1.9.0.jar",
     "iceberg-spark-runtime-3.5_2.12-1.6.1.jar",
     "iceberg-aws-bundle-1.6.1.jar",
 )
 _MAVEN_PACKAGES = (
-    "org.apache.sedona:sedona-spark-shaded-3.5_2.12:1.8.1,"
+    "org.apache.sedona:sedona-spark-shaded-3.5_2.12:1.9.0,"
     "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,"
     "org.apache.iceberg:iceberg-aws-bundle:1.6.1"
 )
@@ -32,15 +32,28 @@ WAREHOUSE_DIR = _OUTPUT_DIR / "warehouse"
 
 @dataclass
 class Region:
-    db_name: str
+    short_name: str
     parquet_path: Path
     replication_url: str
     driver_memory: str = "2g"
     parallelism: int = 8
 
     @property
-    def table_name(self) -> str:
-        return f"hadoop_catalog.{self.db_name}.osm"
+    def db_name(self) -> str:
+        """Per-region test database name (production uses ``kryptosm``)."""
+        return f"krypton_{self.short_name}"
+
+    @property
+    def nodes_table(self) -> str:
+        return f"hadoop_catalog.{self.db_name}.nodes"
+
+    @property
+    def ways_table(self) -> str:
+        return f"hadoop_catalog.{self.db_name}.ways"
+
+    @property
+    def relations_table(self) -> str:
+        return f"hadoop_catalog.{self.db_name}.relations"
 
     @property
     def node_to_ways(self) -> str:
@@ -51,18 +64,30 @@ class Region:
         return f"hadoop_catalog.{self.db_name}.way_to_relations"
 
     @property
+    def node_to_relations(self) -> str:
+        return f"hadoop_catalog.{self.db_name}.node_to_relations"
+
+    @property
+    def relation_to_relations(self) -> str:
+        return f"hadoop_catalog.{self.db_name}.relation_to_relations"
+
+    @property
+    def osc_archive(self) -> str:
+        return f"hadoop_catalog.{self.db_name}.osc_changes"
+
+    @property
     def osc_dir(self) -> Path:
-        return _OUTPUT_DIR / "osc" / self.db_name
+        return _OUTPUT_DIR / "osc" / self.short_name
 
 
 REGIONS = {
     "dc": Region(
-        db_name="dc",
+        short_name="dc",
         parquet_path=_DATA_DIR / "WashingtonDC" / "dc.parquet",
         replication_url="https://download.geofabrik.de/north-america/us/district-of-columbia-updates/",
     ),
     "oregon": Region(
-        db_name="oregon",
+        short_name="oregon",
         parquet_path=_DATA_DIR / "Oregon" / "oregon.parquet",
         replication_url="https://download.geofabrik.de/north-america/us/oregon-updates/",
         driver_memory="8g",

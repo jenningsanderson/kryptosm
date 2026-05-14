@@ -28,12 +28,15 @@ from .geometry.ways import (
     build_ways_geometry_from_linestring,
 )
 from .iceberg import (
+    append_osc_archive,
     delete_from_table,
     get_last_applied_sequence,
     get_table_max_timestamp,
     load_with_geom,
     merge_into_table,
+    refresh_node_to_relations,
     refresh_node_to_ways,
+    refresh_relation_to_relations,
     refresh_way_to_relations,
     set_current_osc_file,
     set_last_applied_sequence,
@@ -211,19 +214,26 @@ def _sequence_from_path(path: str) -> Optional[int]:
 
 def next_osc_path(
     spark: SparkSession,
-    table_name: str,
+    nodes_table: str,
+    ways_table: str,
+    relations_table: str,
+    osc_archive: str,
     download_dir: str,
     base_url: str = DC_REPLICATION_URL,
 ) -> Optional[str]:
     """Download the next pending OSC file and return its local path.
 
-    Returns ``None`` if the table is already up to date.
+    Returns ``None`` if the database is already up to date.
+
+    The last-applied sequence stamp lives on ``osc_archive``; if it's missing
+    (e.g. a freshly init'd database that's never had an OSC apply), we
+    estimate from MAX(timestamp) across the three per-type tables.
     """
     from osmium.replication.server import ReplicationServer
 
     from .replication import download_osc_file, pending_sequences
 
-    last_seq = get_last_applied_sequence(spark, table_name)
+    last_seq = get_last_applied_sequence(spark, osc_archive)
 
     with ReplicationServer(base_url) as server:
         remote_state = server.get_state_info()
@@ -231,19 +241,21 @@ def next_osc_path(
             raise RuntimeError(f"Could not fetch remote state from {base_url}")
 
         if last_seq is None:
-            ts = get_table_max_timestamp(spark, table_name)
+            ts = get_table_max_timestamp(spark, nodes_table, ways_table, relations_table)
             if ts is None:
-                raise ValueError(f"Table {table_name} is empty — run init first.")
+                raise ValueError(
+                    "Krypton database appears empty \u2014 run init first."
+                )
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             last_seq = server.timestamp_to_sequence(ts)
             if last_seq is None:
                 raise RuntimeError(f"Could not map timestamp {ts} to a sequence number")
-            logger.info("No stored sequence — estimated %d from MAX(timestamp) %s", last_seq, ts)
+            logger.info("No stored sequence \u2014 estimated %d from MAX(timestamp) %s", last_seq, ts)
 
         seqs = pending_sequences(last_seq, remote_state.sequence)
         if not seqs:
-            logger.info("Table is current at sequence %d", last_seq)
+            logger.info("Database is current at sequence %d", last_seq)
             return None
 
         logger.info(
@@ -258,63 +270,148 @@ def next_osc_path(
 # ---------------------------------------------------------------------------
 
 
-def _osc_is_redundant(spark: SparkSession, table_name: str) -> bool:
-    """True if the OSC has nothing new for this table.
+def _osc_is_redundant(
+    spark: SparkSession,
+    nodes_table: str,
+    ways_table: str,
+    relations_table: str,
+) -> bool:
+    """True if the OSC has nothing new for any of the per-type tables.
 
     A feature needs applying if it's a create/modify with a higher version
-    than the table (or doesn't exist in the table at all), or a delete for
-    an ID that exists in the table.
+    than the corresponding row in its per-type table (or doesn't exist), or
+    a delete for an ID that exists in the corresponding per-type table.
     """
+    union = " UNION ALL ".join([
+        f"""
+        SELECT o.id, o.op, o.version,
+               t.id  AS target_id, t.version AS target_version
+        FROM osc_latest o
+        LEFT JOIN {nodes_table} t ON o.id = t.id
+        WHERE o.type = 'node'
+        """,
+        f"""
+        SELECT o.id, o.op, o.version,
+               t.id  AS target_id, t.version AS target_version
+        FROM osc_latest o
+        LEFT JOIN {ways_table} t ON o.id = t.id
+        WHERE o.type = 'way'
+        """,
+        f"""
+        SELECT o.id, o.op, o.version,
+               t.id  AS target_id, t.version AS target_version
+        FROM osc_latest o
+        LEFT JOIN {relations_table} t ON o.id = t.id
+        WHERE o.type = 'relation'
+        """,
+    ])
     row = spark.sql(f"""
         SELECT COUNT(*) AS need_apply
-        FROM osc_latest o
-        LEFT JOIN {table_name} t ON o.id = t.id AND o.type = t.type
-        WHERE (o.op IN ('create', 'modify') AND (t.id IS NULL OR t.version < o.version))
-           OR (o.op = 'delete' AND t.id IS NOT NULL)
+        FROM ({union})
+        WHERE (op IN ('create', 'modify')
+               AND (target_id IS NULL OR target_version < version))
+           OR (op = 'delete' AND target_id IS NOT NULL)
     """).collect()[0]
     redundant = row["need_apply"] == 0
     if redundant:
-        logger.info("OSC is redundant — all %d features already at current version",
+        logger.info("OSC is redundant \u2014 all %d features already at current version",
                      spark.sql("SELECT COUNT(*) FROM osc_latest").collect()[0][0])
     else:
         logger.info("OSC has %d features to apply", row["need_apply"])
     return redundant
 
 
+def _classify_node_upserts(
+    spark: SparkSession,
+    osc_node_upserts: str,
+    base_nodes: str,
+    geom_dirty_view: str,
+    tag_only_view: str,
+) -> None:
+    """Split node upserts into geom-dirty (coords moved or new) vs tag-only.
+
+    A node is geom-dirty if it didn't previously exist in the table, or if
+    its (lat, lon) differs from the existing row. Otherwise it's tag-only —
+    its row in ``osm`` still gets updated (version, tags, changeset...) but
+    its parents (ways/relations) don't need geometry rebuilt.
+    """
+    spark.sql(f"""
+        SELECT o.*
+        FROM {osc_node_upserts} o
+        LEFT JOIN {base_nodes} b ON o.id = b.id
+        WHERE b.id IS NULL
+           OR NOT (o.lat <=> b.lat AND o.lon <=> b.lon)
+    """).createOrReplaceTempView(geom_dirty_view)
+
+    spark.sql(f"""
+        SELECT o.*
+        FROM {osc_node_upserts} o
+        JOIN {base_nodes} b ON o.id = b.id
+        WHERE o.lat <=> b.lat AND o.lon <=> b.lon
+    """).createOrReplaceTempView(tag_only_view)
+
+
 def apply_osc(
     spark: SparkSession,
-    table_name: str,
     osc_path: str,
+    nodes_table: str,
+    ways_table: str,
+    relations_table: str,
     node_to_ways: str,
     way_to_relations: str,
+    node_to_relations: str,
+    relation_to_relations: str,
+    osc_archive: str,
 ) -> None:
-    """Apply a single OSC file to the Iceberg table.
+    """Apply a single OSC file to the Krypton per-type tables.
 
     One file -> one dedup -> one geometry rebuild -> one MERGE per type.
     Stamps ``current-osc-file`` and ``last-applied-osc-sequence`` on the
-    table so the next call to ``next_osc_path`` picks up where we left off.
+    OSC archive table so the next call to ``next_osc_path`` picks up where
+    we left off.
 
     Skips the expensive geometry/MERGE pipeline entirely if every feature
-    in the OSC is already in the table at the same or higher version.
+    in the OSC is already in the table at the same or higher version, but
+    still writes the OSC's records to the archive table for audit.
+
+    Behavioural notes:
+      * Node upserts are split into ``geom_dirty_nodes`` (coords actually
+        moved, or new nodes) and ``tag_only_nodes``. Only the geom-dirty set
+        propagates to ways / relations \u2014 tag-only edits don't trigger
+        downstream geometry rebuilds. The full upsert set is still merged
+        into the nodes table so per-node tag/version metadata stays current.
+      * The archive table receives one partition per OSC sequence with the
+        full record set (see ``append_osc_archive``). Even fully-redundant
+        OSCs land in the archive \u2014 the audit value is independent of
+        whether the file moved the database forward.
     """
     label = os.path.basename(osc_path)
-    set_current_osc_file(spark, table_name, label)
+    set_current_osc_file(spark, osc_archive, label)
 
     read_osc_from_file(spark, osc_path).createOrReplaceTempView("osc_raw")
     osc_dedup(spark, "osc_raw", "osc_latest")
 
-    if _osc_is_redundant(spark, table_name):
-        logger.info("%s: fully redundant, skipping", label)
-        seq = _sequence_from_path(osc_path)
+    seq = _sequence_from_path(osc_path)
+
+    # Always archive the OSC's records \u2014 even when the OSC is redundant,
+    # the change log is still queryable history.
+    append_osc_archive(spark, osc_archive, "osc_latest", seq, label)
+
+    if _osc_is_redundant(spark, nodes_table, ways_table, relations_table):
+        logger.info("%s: fully redundant, skipping geometry pipeline", label)
         if seq is not None:
-            set_last_applied_sequence(spark, table_name, seq)
+            set_last_applied_sequence(spark, osc_archive, seq)
         return
 
     logger.info("%s: applying changes", label)
 
-    for osm_type in ("node", "way", "relation"):
-        load_with_geom(spark, table_name, osm_type, f"base_{osm_type}s")
+    # Load each per-type base view (with geom decoded).
+    load_with_geom(spark, nodes_table, "base_nodes")
+    load_with_geom(spark, ways_table, "base_ways")
+    load_with_geom(spark, relations_table, "base_relations")
 
+    # Per-type OSC slices.
+    for osm_type in ("node", "way", "relation"):
         spark.sql(f"""
             SELECT * FROM osc_latest
             WHERE type = '{osm_type}' AND op IN ('create', 'modify')
@@ -324,17 +421,26 @@ def apply_osc(
             SELECT id FROM osc_latest WHERE type = '{osm_type}' AND op = 'delete'
         """).createOrReplaceTempView(f"osc_{osm_type}_deletes")
 
+    # Classify nodes: geom-dirty (coords moved or new) vs tag-only.
+    _classify_node_upserts(
+        spark, "osc_node_upserts", "base_nodes",
+        "geom_dirty_nodes", "tag_only_nodes",
+    )
+
     # --- Nodes ---------------------------------------------------------------
+    # Merge ALL node upserts (including tag-only) so per-node metadata stays
+    # current. Only the geom-dirty subset propagates to parents below.
     build_node_geometry(spark, "osc_node_upserts", "updated_nodes_geom")
     prepare_for_iceberg(spark, "updated_nodes_geom", "node", "nodes_iceberg")
-    merge_into_table(spark, table_name, "nodes_iceberg", "t.id = s.id AND t.type = 'node'")
-    delete_from_table(spark, table_name, "osc_node_deletes", "t.id = s.id AND t.type = 'node'")
-    load_with_geom(spark, table_name, "node", "nodes_with_geom")
+    merge_into_table(spark, nodes_table, "nodes_iceberg", "t.id = s.id")
+    delete_from_table(spark, nodes_table, "osc_node_deletes", "t.id = s.id")
+    load_with_geom(spark, nodes_table, "nodes_with_geom")
     logger.info("%s: nodes merged", label)
 
     # --- Ways ----------------------------------------------------------------
+    # Widen by geom_dirty_nodes only \u2014 tag-only node edits don't change way geometry.
     all_dirty_ways(
-        spark, "base_ways", "osc_way_upserts", "osc_node_upserts",
+        spark, "base_ways", "osc_way_upserts", "geom_dirty_nodes",
         node_to_ways, "dirty_ways",
     )
     spark.sql("SELECT DISTINCT id FROM dirty_ways").persist().createOrReplaceTempView("_dirty_way_ids")
@@ -342,18 +448,23 @@ def apply_osc(
     build_linestring_for_ways(spark, "dirty_ways", "nodes_with_geom", "dirty_ways_lines")
     build_ways_geometry_from_linestring(spark, "dirty_ways_lines", "dirty_ways_geom")
     prepare_for_iceberg(spark, "dirty_ways_geom", "way", "ways_iceberg")
-    merge_into_table(spark, table_name, "ways_iceberg", "t.id = s.id AND t.type = 'way'")
-    delete_from_table(spark, table_name, "osc_way_deletes", "t.id = s.id AND t.type = 'way'")
+    merge_into_table(spark, ways_table, "ways_iceberg", "t.id = s.id")
+    delete_from_table(spark, ways_table, "osc_way_deletes", "t.id = s.id")
 
-    refresh_node_to_ways(spark, table_name, node_to_ways, "_dirty_way_ids")
+    refresh_node_to_ways(spark, ways_table, node_to_ways, "_dirty_way_ids")
     spark.sql(f"DELETE FROM {node_to_ways} WHERE way_id IN (SELECT id FROM osc_way_deletes)")
-    load_with_geom(spark, table_name, "way", "ways_with_geom")
+    load_with_geom(spark, ways_table, "ways_with_geom")
     logger.info("%s: ways merged + index updated", label)
 
     # --- Relations -----------------------------------------------------------
+    # Widen by dirty_ways AND geom_dirty_nodes (via node_to_relations) AND
+    # dirty sub-relations (via relation_to_relations).
     all_dirty_relations(
         spark, "base_relations", "osc_relation_upserts", "dirty_ways",
         way_to_relations, "dirty_relations",
+        dirty_nodes="geom_dirty_nodes",
+        node_to_relations_table=node_to_relations,
+        relation_to_relations_table=relation_to_relations,
     )
     spark.sql(
         "SELECT DISTINCT id FROM dirty_relations"
@@ -365,20 +476,25 @@ def apply_osc(
     relation_merge_geometry_data(spark, "dirty_relations", "rels_geom", "dirty_rels_geom",
                                 ways_geometry="ways_with_geom", nodes_geometry="nodes_with_geom")
     prepare_for_iceberg(spark, "dirty_rels_geom", "relation", "relations_iceberg")
-    merge_into_table(
-        spark, table_name, "relations_iceberg", "t.id = s.id AND t.type = 'relation'"
-    )
-    delete_from_table(
-        spark, table_name, "osc_relation_deletes", "t.id = s.id AND t.type = 'relation'"
-    )
+    merge_into_table(spark, relations_table, "relations_iceberg", "t.id = s.id")
+    delete_from_table(spark, relations_table, "osc_relation_deletes", "t.id = s.id")
 
-    refresh_way_to_relations(spark, table_name, way_to_relations, "_dirty_rel_ids")
+    refresh_way_to_relations(spark, relations_table, way_to_relations, "_dirty_rel_ids")
     spark.sql(
         f"DELETE FROM {way_to_relations} WHERE relation_id IN (SELECT id FROM osc_relation_deletes)"
     )
-    logger.info("%s: relations merged + index updated", label)
+    refresh_node_to_relations(spark, relations_table, node_to_relations, "_dirty_rel_ids")
+    spark.sql(
+        f"DELETE FROM {node_to_relations} WHERE relation_id IN (SELECT id FROM osc_relation_deletes)"
+    )
+    refresh_relation_to_relations(
+        spark, relations_table, relation_to_relations, "_dirty_rel_ids"
+    )
+    spark.sql(
+        f"DELETE FROM {relation_to_relations} WHERE parent_relation_id IN (SELECT id FROM osc_relation_deletes)"
+    )
+    logger.info("%s: relations merged + indexes updated", label)
 
-    seq = _sequence_from_path(osc_path)
     if seq is not None:
-        set_last_applied_sequence(spark, table_name, seq)
-        logger.info("%s: stamped sequence %d", label, seq)
+        set_last_applied_sequence(spark, osc_archive, seq)
+        logger.info("%s: stamped sequence %d on %s", label, seq, osc_archive)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Apply ALL pending OSC files, one at a time, until the table is current.
+Apply ALL pending OSC files, one at a time, until the database is current.
 
 Set KRYPTOSM_REGION=oregon to use Oregon data (default: dc).
 """
@@ -26,8 +26,7 @@ def test_apply_all_pending():
 
     print(f"\n{'=' * 70}")
     print(f"APPLY ALL PENDING OSC FILES — {region.db_name}")
-    print(f"{'=' * 70}")
-    print(f"Table: {region.table_name}\n")
+    print(f"{'=' * 70}\n")
 
     with stage("Spark session"):
         spark = create_spark_session_for_testing(
@@ -37,18 +36,29 @@ def test_apply_all_pending():
         )
 
     try:
-        assert table_exists(spark, region.table_name), \
-            f"{region.table_name} does not exist. Run `make test-e2e-init` first."
+        for tbl in (region.nodes_table, region.ways_table, region.relations_table):
+            assert table_exists(spark, tbl), \
+                f"{tbl} does not exist. Run `make test-e2e-init` first."
 
         with stage("Counts BEFORE"):
-            before = get_table_count(spark, region.table_name)
-            seq_before = get_last_applied_sequence(spark, region.table_name)
+            before = get_table_count(
+                spark,
+                region.nodes_table,
+                region.ways_table,
+                region.relations_table,
+            )
+            seq_before = get_last_applied_sequence(spark, region.osc_archive)
             print(f"  sequence: {seq_before}")
 
         applied = 0
         while True:
             osc_path = next_osc_path(
-                spark, region.table_name, str(region.osc_dir),
+                spark,
+                region.nodes_table,
+                region.ways_table,
+                region.relations_table,
+                region.osc_archive,
+                str(region.osc_dir),
                 base_url=region.replication_url,
             )
             if osc_path is None:
@@ -56,8 +66,13 @@ def test_apply_all_pending():
 
             label = os.path.basename(osc_path)
             with stage(f"Apply {label} (#{applied + 1})"):
-                apply_osc(spark, region.table_name, osc_path,
-                          region.node_to_ways, region.way_to_relations)
+                apply_osc(
+                    spark, osc_path,
+                    region.nodes_table, region.ways_table, region.relations_table,
+                    region.node_to_ways, region.way_to_relations,
+                    region.node_to_relations, region.relation_to_relations,
+                    region.osc_archive,
+                )
             applied += 1
 
         if applied == 0:
@@ -65,8 +80,13 @@ def test_apply_all_pending():
             return
 
         with stage("Counts AFTER"):
-            after = get_table_count(spark, region.table_name)
-            seq_after = get_last_applied_sequence(spark, region.table_name)
+            after = get_table_count(
+                spark,
+                region.nodes_table,
+                region.ways_table,
+                region.relations_table,
+            )
+            seq_after = get_last_applied_sequence(spark, region.osc_archive)
 
         print("=" * 70)
         print(f"Applied {applied} OSC file(s)")

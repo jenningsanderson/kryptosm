@@ -1,9 +1,10 @@
 """
-Glue OSC apply: fetch the next pending OSC file and apply it.
+Glue OSC apply: fetch the next pending OSC file and apply it to Krypton.
 
 Idempotent — each invocation downloads exactly one OSC, MERGEs it into the
-table, and stamps the new sequence number on the table properties. Schedule
-this on a Glue trigger and it will catch up automatically.
+three per-type tables, and stamps the new sequence number on the OSC archive
+table's properties. Schedule this on a Glue trigger and it will catch up
+automatically.
 
 Paste this into the Glue Job "Script" editor (Spark 3.5 / Glue 5.0 / Sedona 1.8).
 """
@@ -23,8 +24,7 @@ from sedona.spark import SedonaContext
 # ---------------------------------------------------------------------------
 WAREHOUSE        = "s3://meta-overture-staging/transportation_splitter/planet-iceberg/warehouse/"
 CATALOG          = "glue_catalog"
-DB_NAME          = "daily_planet"
-TABLE            = "osm"
+DB_NAME          = "kryptosm"
 
 # /tmp on Glue is fast local SSD, wiped between runs — fine, OSC files are tiny.
 OSC_STAGING_DIR  = tempfile.gettempdir()
@@ -32,9 +32,14 @@ OSC_STAGING_DIR  = tempfile.gettempdir()
 # Planet replication (day). Use a country/region URL for sub-planet jobs.
 REPLICATION_URL  = "https://planet.openstreetmap.org/replication/day/"
 
-TABLE_NAME       = f"{CATALOG}.{DB_NAME}.{TABLE}"
-NODE_TO_WAYS     = f"{CATALOG}.{DB_NAME}.node_to_ways"
-WAY_TO_RELATIONS = f"{CATALOG}.{DB_NAME}.way_to_relations"
+NODES_TABLE            = f"{CATALOG}.{DB_NAME}.nodes"
+WAYS_TABLE             = f"{CATALOG}.{DB_NAME}.ways"
+RELATIONS_TABLE        = f"{CATALOG}.{DB_NAME}.relations"
+NODE_TO_WAYS           = f"{CATALOG}.{DB_NAME}.node_to_ways"
+WAY_TO_RELATIONS       = f"{CATALOG}.{DB_NAME}.way_to_relations"
+NODE_TO_RELATIONS      = f"{CATALOG}.{DB_NAME}.node_to_relations"
+RELATION_TO_RELATIONS  = f"{CATALOG}.{DB_NAME}.relation_to_relations"
+OSC_ARCHIVE            = f"{CATALOG}.{DB_NAME}.osc_changes"
 
 # ---------------------------------------------------------------------------
 # Logging — sent to stdout so Glue/CloudWatch picks it up
@@ -48,17 +53,11 @@ logging.basicConfig(
 logging.getLogger("kryptosm").setLevel(logging.INFO)
 logger = logging.getLogger("kryptosm.glue_apply_osc")
 
-logger.info("kryptosm OSC APPLY (Glue) — table=%s", TABLE_NAME)
+logger.info("kryptosm OSC APPLY (Glue) — db=%s.%s", CATALOG, DB_NAME)
 logger.info("  replication: %s", REPLICATION_URL)
 
 # ---------------------------------------------------------------------------
 # Spark / Sedona / Iceberg session
-#
-# NOTE on `-Djts.overlay=ng`: this flag MUST be set as a Glue Job parameter
-# (`--conf spark.driver.extraJavaOptions=-Djts.overlay=ng` and the executor
-# equivalent) — the in-script `.config(...)` calls below are silently ignored
-# on Glue because Glue starts the JVM before this script runs. The lines are
-# kept here so the script also works under a fresh `spark-submit` locally.
 # ---------------------------------------------------------------------------
 spark = SedonaContext.create(
     SparkSession.builder.appName(f"kryptosm-osc-{DB_NAME}")
@@ -79,7 +78,6 @@ spark = SedonaContext.create(
     .getOrCreate()
 )
 
-# Confirm the JTS overlay engine that's actually active on the driver JVM.
 _jts_overlay = spark.sparkContext._jvm.System.getProperty("jts.overlay")
 logger.info("jts.overlay (driver) = %r  (expect 'ng')", _jts_overlay)
 if _jts_overlay != "ng":
@@ -90,16 +88,16 @@ if _jts_overlay != "ng":
     )
 
 # ---------------------------------------------------------------------------
-# Verify the table exists (init must have run first)
+# Verify the per-type tables exist (init must have run first)
 # ---------------------------------------------------------------------------
-assert table_exists(spark, TABLE_NAME), \
-    f"{TABLE_NAME} does not exist. Run glue_init.py first."
+for tbl in (NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE, OSC_ARCHIVE):
+    assert table_exists(spark, tbl), f"{tbl} does not exist. Run glue_init.py first."
 
 # ---------------------------------------------------------------------------
 # Counts BEFORE
 # ---------------------------------------------------------------------------
-before = get_table_count(spark, TABLE_NAME)
-seq_before = get_last_applied_sequence(spark, TABLE_NAME)
+before = get_table_count(spark, NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE)
+seq_before = get_last_applied_sequence(spark, OSC_ARCHIVE)
 logger.info("sequence BEFORE: %s", seq_before)
 
 # ---------------------------------------------------------------------------
@@ -108,7 +106,8 @@ logger.info("sequence BEFORE: %s", seq_before)
 os.makedirs(OSC_STAGING_DIR, exist_ok=True)
 osc_path = next_osc_path(
     spark,
-    TABLE_NAME,
+    NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE,
+    OSC_ARCHIVE,
     OSC_STAGING_DIR,
     base_url=REPLICATION_URL,
 )
@@ -119,13 +118,19 @@ if osc_path is None:
     sys.exit(0)
 
 logger.info("Applying %s (%d bytes)", os.path.basename(osc_path), os.path.getsize(osc_path))
-apply_osc(spark, TABLE_NAME, osc_path, NODE_TO_WAYS, WAY_TO_RELATIONS)
+apply_osc(
+    spark, osc_path,
+    NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE,
+    NODE_TO_WAYS, WAY_TO_RELATIONS,
+    NODE_TO_RELATIONS, RELATION_TO_RELATIONS,
+    OSC_ARCHIVE,
+)
 
 # ---------------------------------------------------------------------------
 # Counts AFTER
 # ---------------------------------------------------------------------------
-after = get_table_count(spark, TABLE_NAME)
-seq_after = get_last_applied_sequence(spark, TABLE_NAME)
+after = get_table_count(spark, NODES_TABLE, WAYS_TABLE, RELATIONS_TABLE)
+seq_after = get_last_applied_sequence(spark, OSC_ARCHIVE)
 
 for osm_type in ("node", "way", "relation"):
     b = before.get(osm_type, 0)

@@ -1,5 +1,11 @@
 """
-Iceberg table operations for the OSM table.
+Iceberg table operations for the Krypton OSM database.
+
+Krypton has three per-type tables (`nodes`, `ways`, `relations`), three
+reverse-index tables (`node_to_ways`, `way_to_relations`, `node_to_relations`),
+and one OSC archive table (`osc_changes`). The archive table also holds the
+``last-applied-osc-sequence`` and ``current-osc-file`` table properties — it's
+the natural single home for "what state the krypton database is in".
 """
 
 import logging
@@ -22,7 +28,7 @@ class TableConfig:
 
     @classmethod
     def testing(cls) -> "TableConfig":
-        """Optimized settings for local tests (< 10M records)."""
+        """Lightweight settings for local tests across all three per-type tables."""
         return cls(
             distribution_mode="range",
             bloom_filter_enabled=True,
@@ -30,13 +36,45 @@ class TableConfig:
         )
 
     @classmethod
-    def production(cls) -> "TableConfig":
-        """Full optimization for planet-scale data (10B+ records)."""
+    def nodes_production(cls) -> "TableConfig":
+        """Planet-scale tuning for ~10B-row nodes table.
+
+        Larger bloom budget per file because the node-id keyspace is huge and
+        point lookups against the nodes table are common (e.g. way-rebuild
+        joins).
+        """
+        return cls(
+            distribution_mode="range",
+            bloom_filter_enabled=True,
+            bloom_filter_max_bytes=8_388_608,
+        )
+
+    @classmethod
+    def ways_production(cls) -> "TableConfig":
+        """Planet-scale tuning for ~1.2B-row ways table."""
         return cls(
             distribution_mode="range",
             bloom_filter_enabled=True,
             bloom_filter_max_bytes=1_048_576,
         )
+
+    @classmethod
+    def relations_production(cls) -> "TableConfig":
+        """Planet-scale tuning for ~12M-row relations table.
+
+        Smaller bloom budget — relations are few, files are wide (members
+        column is bulky), spending lots of bytes on the bloom is wasteful.
+        """
+        return cls(
+            distribution_mode="range",
+            bloom_filter_enabled=True,
+            bloom_filter_max_bytes=262_144,
+        )
+
+    @classmethod
+    def production(cls) -> "TableConfig":
+        """Backwards-compatible default — same shape as the ways factory."""
+        return cls.ways_production()
 
     def _main_table_props(self) -> str:
         lines = [
@@ -87,14 +125,16 @@ def table_exists(spark: SparkSession, table_name: str) -> bool:
         return False
 
 
-def load_with_geom(spark: SparkSession, table_name: str, osm_type: str, view_name: str):
-    """Read one OSM type from the table, decoding WKB geometry back to Sedona geom."""
+def load_with_geom(spark: SparkSession, table_name: str, view_name: str):
+    """Read a per-type table, decoding WKB geometry back to Sedona geom.
+
+    The caller passes the per-type table they want (nodes / ways / relations).
+    All native columns plus a synthesized ``geom`` column are exposed on the
+    resulting view.
+    """
     spark.sql(f"""
-        SELECT id, version, timestamp, uid, user, changeset, tags, lat, lon,
-               refs, members, latest_ts,
-               ST_GeomFromWKB(geometry) AS geom
+        SELECT *, ST_GeomFromWKB(geometry) AS geom
         FROM {table_name}
-        WHERE type = '{osm_type}'
     """).createOrReplaceTempView(view_name)
 
 
@@ -104,54 +144,116 @@ def _ensure_db(spark: SparkSession, table_name: str):
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {'.'.join(parts[:-1])}")
 
 
-def create_iceberg_table(
+def _create_typed_table(
     spark: SparkSession,
     table_name: str,
-    table_location: Optional[str] = None,
-    config: Optional[TableConfig] = None,
-):
-    """Create the OSM Iceberg table (idempotent: drops first to guarantee schema)."""
-    if config is None:
-        config = TableConfig()
+    schema_sql: str,
+    table_location: Optional[str],
+    config: TableConfig,
+) -> None:
+    """Drop+create an Iceberg per-type table with the given column schema."""
     _ensure_db(spark, table_name)
     spark.sql(f"DROP TABLE IF EXISTS {table_name}")
-
     location_clause = (
         f"LOCATION '{table_location}'"
         if table_location and table_location.startswith("s3://")
         else ""
     )
-
     spark.sql(f"""
         CREATE TABLE {table_name} (
-            id        BIGINT,
-            type      STRING,
-            version   BIGINT,
-            timestamp TIMESTAMP,
-            changeset BIGINT,
-            uid       BIGINT,
-            user      STRING,
-            tags      MAP<STRING, STRING>,
-            lat       DOUBLE,
-            lon       DOUBLE,
-            refs      ARRAY<BIGINT>,
-            members   ARRAY<STRUCT<type: STRING, ref: BIGINT, role: STRING>>,
-            latest_ts TIMESTAMP,
-            geometry  BINARY,
-            bbox      STRUCT<xmin: FLOAT, xmax: FLOAT, ymin: FLOAT, ymax: FLOAT>
+            {schema_sql}
         )
         USING iceberg
-        PARTITIONED BY (type)
         {location_clause}
         TBLPROPERTIES (
             {config._main_table_props()}
         )
     """)
-    logger.info("Created table %s (config=%s)", table_name, config)
+
+
+def create_nodes_table(
+    spark: SparkSession,
+    table_name: str,
+    table_location: Optional[str] = None,
+    config: Optional[TableConfig] = None,
+):
+    """Create the krypton nodes Iceberg table (idempotent: drops first).
+
+    Nodes are a single point each — ``lat`` / ``lon`` already define the
+    geometry, so there's no separate ``bbox`` column. Spatial filters use
+    ``lat`` / ``lon`` directly.
+    """
+    if config is None:
+        config = TableConfig()
+    schema = """id                    BIGINT,
+            version               BIGINT,
+            timestamp             TIMESTAMP,
+            changeset             BIGINT,
+            uid                   BIGINT,
+            user                  STRING,
+            tags                  MAP<STRING, STRING>,
+            lat                   DOUBLE,
+            lon                   DOUBLE,
+            latest_ts             TIMESTAMP,
+            additional_changesets ARRAY<BIGINT>,
+            geometry              BINARY"""
+    _create_typed_table(spark, table_name, schema, table_location, config)
+    logger.info("Created nodes table %s (config=%s)", table_name, config)
+
+
+def create_ways_table(
+    spark: SparkSession,
+    table_name: str,
+    table_location: Optional[str] = None,
+    config: Optional[TableConfig] = None,
+):
+    """Create the krypton ways Iceberg table (idempotent: drops first)."""
+    if config is None:
+        config = TableConfig()
+    schema = """id                    BIGINT,
+            version               BIGINT,
+            timestamp             TIMESTAMP,
+            changeset             BIGINT,
+            uid                   BIGINT,
+            user                  STRING,
+            tags                  MAP<STRING, STRING>,
+            refs                  ARRAY<BIGINT>,
+            latest_ts             TIMESTAMP,
+            additional_changesets ARRAY<BIGINT>,
+            geometry              BINARY,
+            bbox                  STRUCT<xmin: FLOAT, xmax: FLOAT, ymin: FLOAT, ymax: FLOAT>"""
+    _create_typed_table(spark, table_name, schema, table_location, config)
+    logger.info("Created ways table %s (config=%s)", table_name, config)
+
+
+def create_relations_table(
+    spark: SparkSession,
+    table_name: str,
+    table_location: Optional[str] = None,
+    config: Optional[TableConfig] = None,
+):
+    """Create the krypton relations Iceberg table (idempotent: drops first)."""
+    if config is None:
+        config = TableConfig()
+    schema = """id                    BIGINT,
+            version               BIGINT,
+            timestamp             TIMESTAMP,
+            changeset             BIGINT,
+            uid                   BIGINT,
+            user                  STRING,
+            tags                  MAP<STRING, STRING>,
+            members               ARRAY<STRUCT<type: STRING, ref: BIGINT, role: STRING>>,
+            latest_ts             TIMESTAMP,
+            additional_changesets ARRAY<BIGINT>,
+            geometry              BINARY,
+            bbox                  STRUCT<xmin: FLOAT, xmax: FLOAT, ymin: FLOAT, ymax: FLOAT>"""
+    _create_typed_table(spark, table_name, schema, table_location, config)
+    logger.info("Created relations table %s (config=%s)", table_name, config)
 
 
 # ---------------------------------------------------------------------------
-# Index tables: node_to_ways, way_to_relations
+# Index tables: node_to_ways, way_to_relations, node_to_relations,
+# relation_to_relations
 # ---------------------------------------------------------------------------
 
 
@@ -159,18 +261,44 @@ def create_index_tables(
     spark: SparkSession,
     node_to_ways: str,
     way_to_relations: str,
+    node_to_relations: Optional[str] = None,
+    relation_to_relations: Optional[str] = None,
     config: Optional[TableConfig] = None,
 ):
-    """Create the reverse-index tables used for dirty-set computation."""
+    """Create the reverse-index tables used for dirty-set computation.
+
+    Three indexes mirror the three member-types a relation can carry: nodes,
+    ways, and other relations. Together they give 1-level widening coverage
+    for every parent feature whose child might have changed.
+    """
     if config is None:
         config = TableConfig()
-    for idx in (node_to_ways, way_to_relations):
+    indexes = [node_to_ways, way_to_relations]
+    if node_to_relations is not None:
+        indexes.append(node_to_relations)
+    if relation_to_relations is not None:
+        indexes.append(relation_to_relations)
+    for idx in indexes:
         _ensure_db(spark, idx)
 
-    for idx, cols, sort_col in [
+    specs = [
         (node_to_ways, "node_id BIGINT, way_id BIGINT", "node_id"),
         (way_to_relations, "way_id BIGINT, relation_id BIGINT", "way_id"),
-    ]:
+    ]
+    if node_to_relations is not None:
+        specs.append(
+            (node_to_relations, "node_id BIGINT, relation_id BIGINT", "node_id")
+        )
+    if relation_to_relations is not None:
+        specs.append(
+            (
+                relation_to_relations,
+                "child_relation_id BIGINT, parent_relation_id BIGINT",
+                "child_relation_id",
+            )
+        )
+
+    for idx, cols, sort_col in specs:
         spark.sql(f"DROP TABLE IF EXISTS {idx}")
         spark.sql(f"""
             CREATE TABLE {idx} ({cols})
@@ -181,18 +309,18 @@ def create_index_tables(
         """)
 
 
-def populate_node_to_ways(spark: SparkSession, table_name: str, node_to_ways: str):
-    """Bulk-populate node_to_ways from the main table's way partition."""
+def populate_node_to_ways(spark: SparkSession, ways_table: str, node_to_ways: str):
+    """Bulk-populate node_to_ways from the ways table."""
     spark.sql(f"""
         INSERT INTO {node_to_ways}
         SELECT explode(refs) AS node_id, id AS way_id
-        FROM {table_name}
-        WHERE type = 'way' AND refs IS NOT NULL
+        FROM {ways_table}
+        WHERE refs IS NOT NULL
     """)
 
 
-def populate_way_to_relations(spark: SparkSession, table_name: str, way_to_relations: str):
-    """Bulk-populate way_to_relations from the main table's relation partition."""
+def populate_way_to_relations(spark: SparkSession, relations_table: str, way_to_relations: str):
+    """Bulk-populate way_to_relations from the relations table."""
     from .geometry.relations import GEOMETRY_RELATION_TYPES
     types = ", ".join(f"'{t}'" for t in GEOMETRY_RELATION_TYPES)
     spark.sql(f"""
@@ -200,25 +328,25 @@ def populate_way_to_relations(spark: SparkSession, table_name: str, way_to_relat
         SELECT member.ref AS way_id, id AS relation_id
         FROM (
             SELECT id, explode(members) AS member
-            FROM {table_name}
-            WHERE type = 'relation' AND tags['type'] IN ({types})
+            FROM {relations_table}
+            WHERE tags['type'] IN ({types})
         )
         WHERE member.type = 'way'
     """)
 
 
-def refresh_node_to_ways(spark: SparkSession, table_name: str, node_to_ways: str, dirty_way_ids: str):
+def refresh_node_to_ways(spark: SparkSession, ways_table: str, node_to_ways: str, dirty_way_ids: str):
     """Delete and re-insert index entries for dirty ways after a MERGE."""
     spark.sql(f"DELETE FROM {node_to_ways} WHERE way_id IN (SELECT id FROM {dirty_way_ids})")
     spark.sql(f"""
         INSERT INTO {node_to_ways}
         SELECT explode(refs) AS node_id, id AS way_id
-        FROM {table_name}
-        WHERE type = 'way' AND id IN (SELECT id FROM {dirty_way_ids})
+        FROM {ways_table}
+        WHERE id IN (SELECT id FROM {dirty_way_ids})
     """)
 
 
-def refresh_way_to_relations(spark: SparkSession, table_name: str, way_to_relations: str, dirty_rel_ids: str):
+def refresh_way_to_relations(spark: SparkSession, relations_table: str, way_to_relations: str, dirty_rel_ids: str):
     """Delete and re-insert index entries for dirty relations after a MERGE."""
     from .geometry.relations import GEOMETRY_RELATION_TYPES
     types = ", ".join(f"'{t}'" for t in GEOMETRY_RELATION_TYPES)
@@ -228,36 +356,252 @@ def refresh_way_to_relations(spark: SparkSession, table_name: str, way_to_relati
         SELECT member.ref AS way_id, id AS relation_id
         FROM (
             SELECT id, explode(members) AS member
-            FROM {table_name}
-            WHERE type = 'relation' AND id IN (SELECT id FROM {dirty_rel_ids})
+            FROM {relations_table}
+            WHERE id IN (SELECT id FROM {dirty_rel_ids})
                   AND tags['type'] IN ({types})
         )
         WHERE member.type = 'way'
     """)
 
 
+def populate_node_to_relations(spark: SparkSession, relations_table: str, node_to_relations: str):
+    """Bulk-populate node_to_relations from the relations table.
+
+    Indexes ALL relations (no tag filter) so future relation types that carry
+    node members work without a re-index migration. Most relations have few
+    node members, so the table stays small relative to way_to_relations.
+    """
+    spark.sql(f"""
+        INSERT INTO {node_to_relations}
+        SELECT member.ref AS node_id, id AS relation_id
+        FROM (
+            SELECT id, explode(members) AS member
+            FROM {relations_table}
+            WHERE members IS NOT NULL
+        )
+        WHERE member.type = 'node'
+    """)
+
+
+def refresh_node_to_relations(
+    spark: SparkSession, relations_table: str, node_to_relations: str, dirty_rel_ids: str
+):
+    """Delete and re-insert node_to_relations entries for dirty relations after a MERGE."""
+    spark.sql(
+        f"DELETE FROM {node_to_relations} WHERE relation_id IN (SELECT id FROM {dirty_rel_ids})"
+    )
+    spark.sql(f"""
+        INSERT INTO {node_to_relations}
+        SELECT member.ref AS node_id, id AS relation_id
+        FROM (
+            SELECT id, explode(members) AS member
+            FROM {relations_table}
+            WHERE id IN (SELECT id FROM {dirty_rel_ids})
+                  AND members IS NOT NULL
+        )
+        WHERE member.type = 'node'
+    """)
+
+
+def populate_relation_to_relations(
+    spark: SparkSession, relations_table: str, relation_to_relations: str
+):
+    """Bulk-populate relation_to_relations (child \u2192 parent edges).
+
+    Lets dirty-set widening cover the case where a sub-relation is edited
+    and we need to also rebuild every parent relation that contains it as a
+    member. Indexes ALL relations regardless of tag-type \u2014 same
+    rationale as node_to_relations.
+    """
+    spark.sql(f"""
+        INSERT INTO {relation_to_relations}
+        SELECT member.ref AS child_relation_id, id AS parent_relation_id
+        FROM (
+            SELECT id, explode(members) AS member
+            FROM {relations_table}
+            WHERE members IS NOT NULL
+        )
+        WHERE member.type = 'relation'
+    """)
+
+
+def refresh_relation_to_relations(
+    spark: SparkSession,
+    relations_table: str,
+    relation_to_relations: str,
+    dirty_rel_ids: str,
+):
+    """Delete and re-insert relation_to_relations entries for dirty parents.
+
+    Note: this refreshes edges where the parent (the dirty relation we just
+    merged) sits. It does NOT refresh edges where this dirty relation is the
+    child of someone else \u2014 those parent edges remain valid (members
+    didn't change just because the child relation got edited).
+    """
+    spark.sql(
+        f"DELETE FROM {relation_to_relations} "
+        f"WHERE parent_relation_id IN (SELECT id FROM {dirty_rel_ids})"
+    )
+    spark.sql(f"""
+        INSERT INTO {relation_to_relations}
+        SELECT member.ref AS child_relation_id, id AS parent_relation_id
+        FROM (
+            SELECT id, explode(members) AS member
+            FROM {relations_table}
+            WHERE id IN (SELECT id FROM {dirty_rel_ids})
+                  AND members IS NOT NULL
+        )
+        WHERE member.type = 'relation'
+    """)
+
+
 # ---------------------------------------------------------------------------
-# Table properties
+# OSC archive table: a queryable history of every applied OSC change.
+# Also the home of the ``last-applied-osc-sequence`` / ``current-osc-file``
+# table properties — the natural single source of truth for "what state the
+# krypton database is in".
 # ---------------------------------------------------------------------------
 
-def get_table_count(spark: SparkSession, table_name: str) -> dict:
-    """Return {osm_type: count} for the OSM table."""
-    rows = spark.sql(f"SELECT type, COUNT(*) AS count FROM {table_name} GROUP BY type").collect()
-    return {row["type"]: row["count"] for row in rows}
+
+def create_osc_archive_table(
+    spark: SparkSession,
+    archive_table: str,
+    table_location: Optional[str] = None,
+    config: Optional[TableConfig] = None,
+):
+    """Create the OSC archive table (idempotent: drops first to guarantee schema).
+
+    One row per OSC change record, partitioned by ``sequence`` so that queries
+    like ``WHERE sequence = 4776`` prune to a single partition.
+    """
+    if config is None:
+        config = TableConfig()
+    _ensure_db(spark, archive_table)
+    spark.sql(f"DROP TABLE IF EXISTS {archive_table}")
+
+    location_clause = (
+        f"LOCATION '{table_location}'"
+        if table_location and table_location.startswith("s3://")
+        else ""
+    )
+
+    spark.sql(f"""
+        CREATE TABLE {archive_table} (
+            sequence    BIGINT,
+            osc_file    STRING,
+            applied_at  TIMESTAMP,
+            id          BIGINT,
+            type        STRING,
+            op          STRING,
+            version     BIGINT,
+            timestamp   TIMESTAMP,
+            changeset   BIGINT,
+            uid         BIGINT,
+            user        STRING,
+            tags        MAP<STRING, STRING>,
+            lat         DOUBLE,
+            lon         DOUBLE,
+            refs        ARRAY<BIGINT>,
+            members     ARRAY<STRUCT<type: STRING, ref: BIGINT, role: STRING>>
+        )
+        USING iceberg
+        PARTITIONED BY (sequence)
+        {location_clause}
+        TBLPROPERTIES (
+            {config._main_table_props()}
+        )
+    """)
+    logger.info("Created OSC archive table %s (config=%s)", archive_table, config)
 
 
-def get_table_max_timestamp(spark: SparkSession, table_name: str) -> Optional[datetime]:
-    """Return the newest ``timestamp`` in the table, or ``None`` if empty."""
-    row = spark.sql(f"SELECT MAX(timestamp) AS max_ts FROM {table_name}").collect()[0]
+def append_osc_archive(
+    spark: SparkSession,
+    archive_table: str,
+    osc_view: str,
+    sequence: Optional[int],
+    osc_file: str,
+):
+    """Append the records from ``osc_view`` to the archive table for one OSC.
+
+    ``osc_view`` is expected to expose the OSC-record columns (matching the
+    OSC_SCHEMA shape: id, type, op, version, timestamp, uid, user, changeset,
+    tags, lat, lon, refs, members). The ``sequence``, ``osc_file``, and
+    ``applied_at`` meta columns are added here.
+    """
+    seq_expr = "CAST(NULL AS BIGINT)" if sequence is None else f"CAST({sequence} AS BIGINT)"
+    file_lit = osc_file.replace("'", "''")
+    spark.sql(f"""
+        INSERT INTO {archive_table}
+        SELECT
+            {seq_expr}                          AS sequence,
+            CAST('{file_lit}' AS STRING)        AS osc_file,
+            current_timestamp()                 AS applied_at,
+            CAST(id AS BIGINT)                  AS id,
+            CAST(type AS STRING)                AS type,
+            CAST(op AS STRING)                  AS op,
+            CAST(version AS BIGINT)             AS version,
+            CAST(timestamp AS TIMESTAMP)        AS timestamp,
+            CAST(changeset AS BIGINT)           AS changeset,
+            CAST(uid AS BIGINT)                 AS uid,
+            user,
+            tags,
+            lat,
+            lon,
+            refs,
+            members
+        FROM {osc_view}
+    """)
+
+
+# ---------------------------------------------------------------------------
+# Counts / max timestamp across the three per-type tables
+# ---------------------------------------------------------------------------
+
+
+def get_table_count(
+    spark: SparkSession,
+    nodes_table: str,
+    ways_table: str,
+    relations_table: str,
+) -> dict:
+    """Return ``{'node': N, 'way': W, 'relation': R}`` counts."""
+    counts = {}
+    for kind, name in (
+        ("node", nodes_table),
+        ("way", ways_table),
+        ("relation", relations_table),
+    ):
+        rows = spark.sql(f"SELECT COUNT(*) AS n FROM {name}").collect()
+        counts[kind] = rows[0]["n"]
+    return counts
+
+
+def get_table_max_timestamp(
+    spark: SparkSession,
+    nodes_table: str,
+    ways_table: str,
+    relations_table: str,
+) -> Optional[datetime]:
+    """Return the newest ``timestamp`` across all three per-type tables, or None."""
+    union = " UNION ALL ".join(
+        f"SELECT MAX(timestamp) AS ts FROM {t}"
+        for t in (nodes_table, ways_table, relations_table)
+    )
+    row = spark.sql(f"SELECT MAX(ts) AS max_ts FROM ({union})").collect()[0]
     return row["max_ts"]
 
 
+# ---------------------------------------------------------------------------
+# Sequence stamping — lives on the OSC archive table.
+# ---------------------------------------------------------------------------
+
 _OSC_SEQ_PROPERTY = "last-applied-osc-sequence"
+_OSC_FILE_PROPERTY = "current-osc-file"
 
 
-def get_last_applied_sequence(spark: SparkSession, table_name: str) -> Optional[int]:
-    """Return the last-applied OSC sequence number, or ``None`` if never set."""
-    rows = spark.sql(f"SHOW TBLPROPERTIES {table_name} ('{_OSC_SEQ_PROPERTY}')").collect()
+def get_last_applied_sequence(spark: SparkSession, archive_table: str) -> Optional[int]:
+    """Return the last-applied OSC sequence number on the archive table, or None."""
+    rows = spark.sql(f"SHOW TBLPROPERTIES {archive_table} ('{_OSC_SEQ_PROPERTY}')").collect()
     if not rows:
         return None
     value = rows[0][1]
@@ -266,20 +610,17 @@ def get_last_applied_sequence(spark: SparkSession, table_name: str) -> Optional[
     return int(value)
 
 
-def set_last_applied_sequence(spark: SparkSession, table_name: str, seq: int) -> None:
-    """Stamp the table with the last-applied OSC sequence number."""
+def set_last_applied_sequence(spark: SparkSession, archive_table: str, seq: int) -> None:
+    """Stamp the archive table with the last-applied OSC sequence number."""
     spark.sql(
-        f"ALTER TABLE {table_name} SET TBLPROPERTIES ('{_OSC_SEQ_PROPERTY}' = '{seq}')"
+        f"ALTER TABLE {archive_table} SET TBLPROPERTIES ('{_OSC_SEQ_PROPERTY}' = '{seq}')"
     )
 
 
-_OSC_FILE_PROPERTY = "current-osc-file"
-
-
-def set_current_osc_file(spark: SparkSession, table_name: str, filename: str) -> None:
-    """Stamp the table with the OSC file currently being applied."""
+def set_current_osc_file(spark: SparkSession, archive_table: str, filename: str) -> None:
+    """Stamp the archive table with the OSC file currently being applied."""
     spark.sql(
-        f"ALTER TABLE {table_name} SET TBLPROPERTIES ('{_OSC_FILE_PROPERTY}' = '{filename}')"
+        f"ALTER TABLE {archive_table} SET TBLPROPERTIES ('{_OSC_FILE_PROPERTY}' = '{filename}')"
     )
 
 

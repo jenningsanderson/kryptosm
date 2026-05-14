@@ -10,6 +10,8 @@ single ID with role labels. The `tags['type']` decides what we build:
 All other relation types are kept in the table with NULL geometry.
 """
 
+from typing import Optional
+
 from pyspark.sql import SparkSession
 
 # Relation `tags['type']` values for which we build geometry.
@@ -45,7 +47,7 @@ def relations_need_geometry(spark: SparkSession, relations_data: str, result_vie
     """
     spark.sql(f"""
         SELECT id, members, tags,
-               COALESCE(timestamp, current_timestamp()) AS latest_ts
+               CAST(timestamp AS TIMESTAMP) AS latest_ts
         FROM {relations_data}
         WHERE tags['type'] IN ({_quote_csv(GEOMETRY_RELATION_TYPES)})
     """).createOrReplaceTempView(result_view)
@@ -53,7 +55,7 @@ def relations_need_geometry(spark: SparkSession, relations_data: str, result_vie
 
 def construct_multipolygon(
     spark: SparkSession, relations_data: str, ways_geometry: str, result_view: str,
-    nodes_geometry: str = None,
+    nodes_geometry: Optional[str] = None,
 ):
     """
     Build geometries for relations — polygon, line, and collection types.
@@ -295,7 +297,7 @@ def construct_multipolygon(
 
 def relation_merge_geometry_data(
     spark: SparkSession, relations_data: str, geometry_only_data: str, result_view: str,
-    ways_geometry: str = None, nodes_geometry: str = None,
+    ways_geometry: Optional[str] = None, nodes_geometry: Optional[str] = None,
 ):
     """
     Left-join all relations with their built geometry.
@@ -304,6 +306,11 @@ def relation_merge_geometry_data(
     keep it. Relations without geometry get a fallback GeometryCollection built
     from whatever member way/node geometries are available, giving them a
     meaningful bbox.
+
+    Also computes ``additional_changesets`` — the set of changesets from each
+    direct way/node member (minus the relation's own changeset). Sub-relation
+    members are not recursed; their own changesets are reachable via their
+    own ``additional_changesets`` columns.
     """
     if ways_geometry:
         # Only compute fallback for relations that construct_multipolygon
@@ -356,6 +363,54 @@ def relation_merge_geometry_data(
         fallback_expr = """
             b.geom"""
 
+    # ----- additional_changesets: collect_set from direct way/node members ---
+    cs_parts = []
+    if ways_geometry:
+        cs_parts.append(f"""
+            SELECT r.id AS relation_id,
+                   w.changeset AS member_changeset
+            FROM (
+                SELECT id, explode(members) AS member
+                FROM {relations_data}
+            ) r
+            JOIN {ways_geometry} w ON w.id = r.member.ref
+            WHERE r.member.type = 'way'
+                  AND w.changeset IS NOT NULL
+        """)
+    if nodes_geometry:
+        cs_parts.append(f"""
+            SELECT r.id AS relation_id,
+                   n.changeset AS member_changeset
+            FROM (
+                SELECT id, explode(members) AS member
+                FROM {relations_data}
+            ) r
+            JOIN {nodes_geometry} n ON n.id = r.member.ref
+            WHERE r.member.type = 'node'
+                  AND n.changeset IS NOT NULL
+        """)
+
+    if cs_parts:
+        cs_union = " UNION ALL ".join(cs_parts)
+        spark.sql(f"""
+            SELECT relation_id,
+                   collect_set(member_changeset) AS member_changesets
+            FROM ({cs_union})
+            GROUP BY relation_id
+        """).createOrReplaceTempView("_rel_member_changesets")
+        cs_join = "LEFT OUTER JOIN _rel_member_changesets c ON a.id = c.relation_id"
+        # Only retain member changesets STRICTLY greater than self.changeset.
+        # Older child changesets are already implicit at the time of the
+        # parent's last edit, so they don't add attribution information; this
+        # also bounds the column from growing unboundedly over time.
+        cs_expr = (
+            "COALESCE(filter(c.member_changesets, x -> x > a.changeset),\n"
+            "                     CAST(array() AS ARRAY<BIGINT>))"
+        )
+    else:
+        cs_join = ""
+        cs_expr = "CAST(array() AS ARRAY<BIGINT>)"
+
     spark.sql(f"""
         SELECT
             a.id,
@@ -365,16 +420,15 @@ def relation_merge_geometry_data(
             a.user,
             CAST(a.changeset AS BIGINT)          AS changeset,
             a.tags,
-            a.lat,
-            a.lon,
-            CAST(NULL AS ARRAY<BIGINT>)          AS refs,
             a.members,
             GREATEST(
-                COALESCE(a.timestamp, current_timestamp()),
-                COALESCE(b.latest_ts, timestamp_seconds(0))
+                a.timestamp,
+                b.latest_ts
             ) AS latest_ts,
+            {cs_expr} AS additional_changesets,
             {fallback_expr} AS geom
         FROM {relations_data} a
         LEFT OUTER JOIN {geometry_only_data} b ON a.id = b.id
         {fallback_join}
+        {cs_join}
     """).createOrReplaceTempView(result_view)

@@ -56,14 +56,14 @@ def build_linestring_for_ways(
     Build a LineString per way by collecting its node geometries in order.
 
     Input view (`ways_data`) columns:
-        id, version, timestamp, uid, user, changeset, tags, lat, lon,
-        refs (ARRAY<BIGINT>), members
+        id, version, timestamp, uid, user, changeset, tags, refs (ARRAY<BIGINT>)
+        (extra columns are tolerated but ignored)
     Input view (`nodes_geometry`) columns:
-        id, latest_ts, geom (ST_Point)
+        id, latest_ts, changeset, geom (ST_Point)
 
     Output view (`result_view`) columns:
-        id, version, timestamp, uid, user, changeset, tags, lat, lon,
-        refs (ARRAY<BIGINT>), members, latest_ts, geom (ST_LineString or NULL)
+        id, version, timestamp, uid, user, changeset, tags, refs (ARRAY<BIGINT>),
+        latest_ts, additional_changesets, geom (ST_LineString or NULL)
 
     Why:
         - `refs` is the canonical flat-array form. OSM Parquet stores node
@@ -78,8 +78,12 @@ def build_linestring_for_ways(
     spark.sql(f"""
         SELECT
             a.id, a.version, a.timestamp, a.uid, a.user, a.changeset, a.tags,
-            a.lat, a.lon, a.refs, a.members,
+            a.refs,
             GREATEST(a.timestamp, b.latest_ts) AS latest_ts,
+            COALESCE(
+                filter(b.member_changesets, x -> x > a.changeset),
+                CAST(array() AS ARRAY<BIGINT>)
+            ) AS additional_changesets,
             IF (
                 b.node_geom IS NOT NULL AND cardinality(b.node_geom) > 1,
                 ST_LineFromMultiPoint(ST_Collect(b.node_geom.geom)),
@@ -90,7 +94,8 @@ def build_linestring_for_ways(
             SELECT
                 w.id,
                 MAX(n.latest_ts) AS latest_ts,
-                sort_array(collect_list(struct(w.node_pos, n.geom))) AS node_geom
+                sort_array(collect_list(struct(w.node_pos, n.geom))) AS node_geom,
+                collect_set(n.changeset) AS member_changesets
             FROM (
                 SELECT id, posexplode(refs) AS (node_pos, node_id)
                 FROM {ways_data}
@@ -131,8 +136,8 @@ def build_ways_geometry_from_linestring(
     Promote closed ways with area-like tags from LineString to Polygon.
 
     Input view (`ways_linestrings`) columns:
-        id, version, timestamp, uid, user, changeset, tags, lat, lon, refs,
-        members, latest_ts, geom (ST_LineString or NULL)
+        id, version, timestamp, uid, user, changeset, tags, refs,
+        latest_ts, additional_changesets, geom (ST_LineString or NULL)
 
     Output view (`result_view`) columns:
         same shape, but `geom` is ST_Polygon when the way is closed and
@@ -148,8 +153,8 @@ def build_ways_geometry_from_linestring(
     """
     spark.sql(f"""
         SELECT
-            id, version, timestamp, uid, user, changeset, tags, lat, lon,
-            refs, members, latest_ts,
+            id, version, timestamp, uid, user, changeset, tags,
+            refs, latest_ts, additional_changesets,
             IF (
                 geom IS NOT NULL
                 AND ST_NumPoints(geom) > 3

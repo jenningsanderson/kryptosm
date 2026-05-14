@@ -1,9 +1,16 @@
 """
-Convert a `geom` view into the layout the Iceberg OSM table expects.
+Convert a `geom` view into the layout each per-type Krypton table expects.
 
-This is the last step of the pipeline. It serializes geometries to WKB,
-adds the bbox struct, pins the partition column (`type`), and repartitions
-for parallel write.
+This is the last step of the pipeline. It serializes geometries to WKB, adds
+the bbox struct (ways/relations only — nodes carry lat/lon directly), and
+projects only the columns relevant to the target type:
+
+- nodes:     id, version, timestamp, changeset, uid, user, tags, lat, lon,
+             latest_ts, additional_changesets, geometry
+- ways:      id, version, timestamp, changeset, uid, user, tags, refs,
+             latest_ts, additional_changesets, geometry, bbox
+- relations: id, version, timestamp, changeset, uid, user, tags, members,
+             latest_ts, additional_changesets, geometry, bbox
 
 Hygiene applied at the WKB boundary (see ``_hygienic_geom``):
     * ``ST_Force_2D``          — strip any Z value
@@ -81,6 +88,42 @@ def _geometry_expr(osm_type: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-type column projections
+# ---------------------------------------------------------------------------
+
+# Common columns every per-type table carries (excluding `geometry` and `bbox`,
+# which are emitted separately because they involve geometry-engine calls).
+_COMMON_COLUMNS = """
+            id,
+            CAST(version AS BIGINT)             AS version,
+            CAST(timestamp AS TIMESTAMP)        AS timestamp,
+            CAST(changeset AS BIGINT)           AS changeset,
+            CAST(uid AS BIGINT)                 AS uid,
+            user,
+            tags,
+            CAST(latest_ts AS TIMESTAMP)        AS latest_ts,
+            COALESCE(additional_changesets, CAST(array() AS ARRAY<BIGINT>))
+                                                AS additional_changesets"""
+
+_NODE_TYPE_COLUMNS = """
+            lat,
+            lon"""
+
+_WAY_TYPE_COLUMNS = """
+            refs"""
+
+_RELATION_TYPE_COLUMNS = """
+            members"""
+
+_BBOX_STRUCT = """STRUCT(
+                CAST(ST_XMin(geom) AS FLOAT) AS xmin,
+                CAST(ST_XMax(geom) AS FLOAT) AS xmax,
+                CAST(ST_YMin(geom) AS FLOAT) AS ymin,
+                CAST(ST_YMax(geom) AS FLOAT) AS ymax
+            )"""
+
+
 def prepare_for_iceberg(
     spark: SparkSession,
     data_view: str,
@@ -88,7 +131,7 @@ def prepare_for_iceberg(
     result_view: str,
 ):
     """
-    Project a geom-bearing view into the Iceberg table's column layout.
+    Project a geom-bearing view into the per-type Krypton table column layout.
 
     For nodes and ways, rows with NULL geom are dropped (they failed
     geometry construction). For relations, NULL geom is kept — many
@@ -98,57 +141,84 @@ def prepare_for_iceberg(
     1.8.x can produce JTS-null-in-UDT objects that pass ``IS NOT NULL``
     but NPE when any geometry function touches them. The WHERE filter in
     the first branch runs at the scan level, before expression evaluation.
-    """
-    _columns = f"""
-            id,
-            CAST('{osm_type}' AS STRING)        AS type,
-            CAST(version AS BIGINT)             AS version,
-            CAST(timestamp AS TIMESTAMP)        AS timestamp,
-            CAST(changeset AS BIGINT)           AS changeset,
-            CAST(uid AS BIGINT)                 AS uid,
-            user,
-            tags,
-            lat,
-            lon,
-            refs,
-            members,
-            CAST(latest_ts AS TIMESTAMP)        AS latest_ts"""
 
-    if osm_type != "relation":
+    A defensive ``ROW_NUMBER() = 1`` filter guarantees uniqueness by ``id``
+    at the MERGE-source boundary. Upstream stages should already be unique
+    per id, but if the table picked up duplicates from a previous failed
+    run, this filter prevents ``MERGE_CARDINALITY_VIOLATION`` errors. We
+    keep the row with the highest version, breaking ties by latest_ts.
+    """
+    if osm_type == "node":
+        # Nodes: lat/lon, no bbox. NULL geom rows dropped.
         spark.sql(f"""
+            WITH _ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY id
+                           ORDER BY version DESC NULLS LAST,
+                                    latest_ts DESC NULLS LAST
+                       ) AS _rn
+                FROM {data_view}
+                WHERE geom IS NOT NULL
+            )
             SELECT
-                {_columns},
-                ST_AsBinary({_hygienic_geom("geom")})  AS geometry,
-                STRUCT(
-                    CAST(ST_XMin(geom) AS FLOAT) AS xmin,
-                    CAST(ST_XMax(geom) AS FLOAT) AS xmax,
-                    CAST(ST_YMin(geom) AS FLOAT) AS ymin,
-                    CAST(ST_YMax(geom) AS FLOAT) AS ymax
-                )                                   AS bbox
-            FROM {data_view}
-            WHERE geom IS NOT NULL
+                {_COMMON_COLUMNS},
+                {_NODE_TYPE_COLUMNS},
+                ST_AsBinary({_hygienic_geom("geom")})  AS geometry
+            FROM _ranked
+            WHERE _rn = 1
         """).createOrReplaceTempView(result_view)
-    else:
+    elif osm_type == "way":
+        # Ways: refs, bbox. NULL geom rows dropped.
         spark.sql(f"""
+            WITH _ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY id
+                           ORDER BY version DESC NULLS LAST,
+                                    latest_ts DESC NULLS LAST
+                       ) AS _rn
+                FROM {data_view}
+                WHERE geom IS NOT NULL
+            )
             SELECT
-                {_columns},
-                {_geometry_expr(osm_type)}          AS geometry,
-                STRUCT(
-                    CAST(ST_XMin(geom) AS FLOAT) AS xmin,
-                    CAST(ST_XMax(geom) AS FLOAT) AS xmax,
-                    CAST(ST_YMin(geom) AS FLOAT) AS ymin,
-                    CAST(ST_YMax(geom) AS FLOAT) AS ymax
-                )                                   AS bbox
-            FROM {data_view}
-            WHERE geom IS NOT NULL
+                {_COMMON_COLUMNS},
+                {_WAY_TYPE_COLUMNS},
+                ST_AsBinary({_hygienic_geom("geom")})  AS geometry,
+                {_BBOX_STRUCT}                          AS bbox
+            FROM _ranked
+            WHERE _rn = 1
+        """).createOrReplaceTempView(result_view)
+    elif osm_type == "relation":
+        # Relations: members, bbox. NULL geom kept (relations may have no geometry).
+        spark.sql(f"""
+            WITH _ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY id
+                           ORDER BY version DESC NULLS LAST,
+                                    latest_ts DESC NULLS LAST
+                       ) AS _rn
+                FROM {data_view}
+            )
+            SELECT
+                {_COMMON_COLUMNS},
+                {_RELATION_TYPE_COLUMNS},
+                {_geometry_expr(osm_type)}              AS geometry,
+                {_BBOX_STRUCT}                          AS bbox
+            FROM _ranked
+            WHERE _rn = 1 AND geom IS NOT NULL
             UNION ALL
             SELECT
-                {_columns},
-                CAST(NULL AS BINARY)                AS geometry,
+                {_COMMON_COLUMNS},
+                {_RELATION_TYPE_COLUMNS},
+                CAST(NULL AS BINARY)                    AS geometry,
                 CAST(NULL AS
                     STRUCT<xmin: FLOAT, xmax: FLOAT,
                            ymin: FLOAT, ymax: FLOAT>
-                )                                   AS bbox
-            FROM {data_view}
-            WHERE geom IS NULL
+                )                                       AS bbox
+            FROM _ranked
+            WHERE _rn = 1 AND geom IS NULL
         """).createOrReplaceTempView(result_view)
+    else:
+        raise ValueError(f"Unknown osm_type {osm_type!r}; expected node/way/relation")
