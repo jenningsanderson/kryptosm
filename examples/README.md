@@ -31,36 +31,80 @@ digits, and underscores.
 
 ## Submitting as a Glue 5.0 job
 
-These scripts target **Glue 5.0** (Spark 3.5, Python 3.11) with **Apache Sedona 1.8**.
-Glue 5.0 ships Iceberg 1.6 out of the box, so you only need to pull in Sedona
-yourself.
+These scripts target **Glue 5.0** (Spark 3.5, Python 3.11) with **Apache
+Sedona 1.9+** (which bundles JTS 1.20+, where the robust OverlayNG engine is
+the default — no JTS system property needed). Glue 5.0 ships Iceberg 1.6 out
+of the box, so you only need to pull in Sedona yourself.
 
-Required job parameters:
+### Job parameters
+
+In the Glue console: **Job details → Advanced properties → Job parameters.**
+Each row is one parameter (a `Key` + a `Value`). Add these one row at a time:
+
+| Key                           | Value                                                                                                                |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `--datalake-formats`          | `iceberg`                                                                                                            |
+| `--additional-python-modules` | `apache-sedona==1.9.0,kryptosm`                                                                                      |
+| `--extra-jars`                | `s3://YOUR-BUCKET/jars/sedona-spark-shaded-3.5_2.12-1.9.0.jar,s3://YOUR-BUCKET/jars/geotools-wrapper-1.7.0-28.5.jar` |
+| `--conf`                      | _(see below)_                                                                                                        |
+
+Pin the Sedona Python wheel and the shaded JAR to the **same** version (and
+make sure that version's the one you uploaded to S3).
+
+### The single `--conf` value
+
+The `--conf` parameter is the one that's easy to get wrong, and the wrong
+format produces `IllegalArgumentException: Invalid input to --conf`.
+
+> ⚠️ **Use exactly ONE `--conf` job-parameter row.** Its value is a
+> **space-separated** chain of `key=value` pairs, with the literal text
+> `--conf` between each pair. Do **not** add multiple rows whose key is
+> `--conf`, and do **not** include line breaks inside the value field.
+
+Paste this whole thing as the single value of the one `--conf` parameter:
 
 ```text
---datalake-formats              iceberg
-
---additional-python-modules     apache-sedona==1.8.0,kryptosm
-
---extra-jars                    s3://YOUR-BUCKET/jars/sedona-spark-shaded-3.5_2.12-1.8.1.jar,s3://YOUR-BUCKET/jars/geotools-wrapper-1.7.0-28.5.jar
-
---conf                          spark.serializer=org.apache.spark.serializer.KryoSerializer
---conf spark.kryo.registrator=org.apache.sedona.core.serde.SedonaKryoRegistrator
-                                  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.sedona.viz.sql.SedonaVizExtensions,org.apache.sedona.sql.SedonaSqlExtensions
-                                  --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
-                                  --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
-                                  --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-                                  --conf spark.sql.catalog.glue_catalog.warehouse=s3://meta-overture-staging/planet-iceberg/warehouse/
+spark.serializer=org.apache.spark.serializer.KryoSerializer --conf spark.kryo.registrator=org.apache.sedona.core.serde.SedonaKryoRegistrator --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.sedona.viz.sql.SedonaVizExtensions,org.apache.sedona.sql.SedonaSqlExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.catalog.glue_catalog.warehouse=s3://meta-overture-staging/transportation_splitter/planet-iceberg/warehouse/
 ```
 
-Notes:
+Note that the value **starts directly with the first key=value** (no leading
+`--conf`) and uses `--conf` as the separator from the second pair onward.
+This is AWS Glue's convention, not standard Spark CLI.
 
-- The Sedona shaded JAR (`sedona-spark-shaded-3.5_2.12-1.8.1.jar`) and its
+> ℹ️ **No `extraJavaOptions` needed.** With Sedona 1.9+ / JTS 1.20+, the
+> robust OverlayNG engine is the default. Earlier versions required
+> `-Djts.overlay=ng` — that flag (and the `extraJavaOptions` it travels with)
+> is also blocked by Glue 5.0's job-parameter validator, which is why
+> upgrading Sedona is the cleaner fix here.
+
+### After it runs
+
+Watch CloudWatch for the per-stage `[N/8]` log lines emitted by the script.
+A successful relations stage looks like:
+
+```text
+kryptosm.glue_init: [6/8] Build + write relations
+...
+kryptosm.glue_init: [8/8] Final counts
+kryptosm.glue_init:   node           ...
+kryptosm.glue_init:   way            ...
+kryptosm.glue_init:   relation       ...
+kryptosm.glue_init: kryptosm INIT complete — glue_catalog.daily_planet.osm
+```
+
+### Other notes
+
+- The Sedona shaded JAR (`sedona-spark-shaded-3.5_2.12-1.9.0.jar`) and its
   `geotools-wrapper` companion must be uploaded to S3 and referenced via
   `--extra-jars`. Glue's package mirror does not ship them.
-- `apache-sedona==1.8.0` provides the Python bindings used by `SedonaContext`.
+- `apache-sedona==1.9.0` provides the Python bindings used by `SedonaContext`.
+  Keep the Python wheel version and the JAR version in lockstep.
 - `--datalake-formats iceberg` ensures the Iceberg runtime + AWS bundle are on
   the classpath.
+- After editing `kryptosm` source, **bump the version in `pyproject.toml`** and
+  rebuild the wheel before re-running the Glue job. `--additional-python-modules`
+  caches by package name + version; without a version bump Glue may serve the
+  previously installed wheel and your fixes won't take effect.
 
 Both scripts also work with `spark-submit` outside Glue if you set the same
 configs yourself.

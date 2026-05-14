@@ -35,26 +35,34 @@ WKB_PRECISION_DECIMALS = 7
 
 
 def _hygienic_geom(geom_expr: str = "geom") -> str:
-    """SQL fragment producing a 2D, precision-snapped, valid, CCW-wound geometry.
+    """SQL fragment producing a 2D, valid, precision-snapped, CCW-wound geometry.
 
     Pipeline order is deliberate:
 
       1. ``ST_Force_2D``         — strip any Z value (cheap, harmless on 2D).
-      2. ``ST_ReducePrecision``  — snap coordinates to a fixed grid; can in
-                                   theory introduce invalidity by collapsing
-                                   near-coincident points into duplicates,
-                                   so it must run BEFORE MakeValid.
-      3. ``ST_MakeValid``        — repair topology: self-intersections,
-                                   collapsed slivers, ring orientation issues
-                                   left over from ST_BuildArea / ST_Difference
-                                   in the relation pipeline. Idempotent and
+      2. ``ST_MakeValid`` (1)    — fix any topology issues from the source
+                                   pipeline (self-intersecting closed ways,
+                                   sliver artifacts from ST_Difference, etc.).
+                                   Must run BEFORE ReducePrecision because
+                                   GeometryPrecisionReducer throws
+                                   "Reduction failed, possible invalid input"
+                                   on invalid geometries.
+      3. ``ST_ReducePrecision``  — snap coordinates to a fixed grid. Cheap and
+                                   reliable on the now-valid input.
+      4. ``ST_MakeValid`` (2)    — defensive: snap can collapse near-coincident
+                                   vertices into duplicates, occasionally
+                                   re-introducing invalidity. Idempotent and
                                    nearly free on already-valid inputs.
-      4. ``ST_ForcePolygonCCW``  — canonical OGC / RFC 7946 winding (CCW
+      5. ``ST_ForcePolygonCCW``  — canonical OGC / RFC 7946 winding (CCW
                                    exterior, CW interiors). No-op on
                                    non-polygon geometries, idempotent on
                                    already-CCW polygons.
+
+    The two MakeValid calls add cost only on geometries that were actually
+    invalid; on valid input both are short-circuit idempotent.
     """
     expr = f"ST_Force_2D({geom_expr})"
+    expr = f"ST_MakeValid({expr})"
     expr = f"ST_ReducePrecision({expr}, {WKB_PRECISION_DECIMALS})"
     expr = f"ST_MakeValid({expr})"
     expr = f"ST_ForcePolygonCCW({expr})"

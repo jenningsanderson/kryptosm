@@ -1,6 +1,6 @@
 [project]
 name = "kryptosm"
-version = "0.1.0"
+version = "0.3.0"
 description = "A utility for processing OpenStreetMap data into Apache Iceberg tables"
 requires-python = ">=3.8"
 license = {text = "Apache-2.0"}

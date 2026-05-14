@@ -67,6 +67,12 @@ logger.info("  warehouse: %s", WAREHOUSE)
 
 # ---------------------------------------------------------------------------
 # Spark / Sedona / Iceberg session
+#
+# NOTE on `-Djts.overlay=ng`: this flag MUST be set as a Glue Job parameter
+# (`--conf spark.driver.extraJavaOptions=-Djts.overlay=ng` and the executor
+# equivalent) — the in-script `.config(...)` calls below are silently ignored
+# on Glue because Glue starts the JVM before this script runs. The lines are
+# kept here so the script also works under a fresh `spark-submit` locally.
 # ---------------------------------------------------------------------------
 spark = SedonaContext.create(
     SparkSession.builder.appName(f"kryptosm-init-{DB_NAME}")
@@ -86,6 +92,22 @@ spark = SedonaContext.create(
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     .getOrCreate()
 )
+
+# Confirm the JTS overlay engine that's actually active on the driver JVM.
+# Glue 5.0 blocks `--conf spark.driver.extraJavaOptions=-Djts.overlay=ng`, so
+# we set it programmatically here as a fallback. JTS 1.19's Geometry overlay
+# operators read this property at call time, so this will take effect for any
+# overlay run on the DRIVER JVM (planning, driver-side aggregation, etc.).
+# Executor JVMs are unaffected — they need spark.executor.extraJavaOptions
+# (also blocked by Glue) or a Sedona/JTS upgrade to 1.20+ where NG is default.
+spark.sparkContext._jvm.System.setProperty("jts.overlay", "ng")
+_jts_overlay = spark.sparkContext._jvm.System.getProperty("jts.overlay")
+logger.info("jts.overlay (driver) = %r  (expect 'ng')", _jts_overlay)
+if _jts_overlay != "ng":
+    logger.warning(
+        "jts.overlay is not 'ng' on the driver — programmatic setProperty "
+        "did not take effect. Relations stage may fail."
+    )
 
 
 def _has_rows(name: str) -> bool:
