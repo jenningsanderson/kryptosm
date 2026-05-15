@@ -568,8 +568,11 @@ def _apply_relation_section(
         ways_geometry="ways_with_geom", nodes_geometry="nodes_with_geom",
     )
     prepare_for_iceberg(spark, "dirty_rels_geom", "relation", "relations_iceberg")
-    logger.info("%s: relation geometry built, merging into %s", label, relations_table)
+    relations_to_merge = spark.table("relations_iceberg").persist()
+    logger.info("%s: relation geometry built (%d rows), merging into %s",
+                label, relations_to_merge.count(), relations_table)
     merge_upsert_delete(spark, relations_table, "relations_iceberg", "osc_relation_deletes")
+    relations_to_merge.unpersist()
 
     logger.info("%s: refreshing relation indexes", label)
     refresh_way_to_relations(spark, relations_table, way_to_relations, "_dirty_rel_ids")

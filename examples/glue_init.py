@@ -38,14 +38,14 @@ from kryptosm import (
 )
 from kryptosm.iceberg import table_exists
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import array, coalesce, col, lit
 from sedona.spark import SedonaContext
 
 # ---------------------------------------------------------------------------
 # Config — edit these for your environment
 # ---------------------------------------------------------------------------
 INPUT_PARQUET = "s3://meta-overture-staging/planet-iceberg/raw/"
-WAREHOUSE     = "s3://meta-overture-staging/transportation-splitter/planet-iceberg/warehouse/"
+WAREHOUSE     = "s3://meta-overture-staging/transportation_splitter/planet-iceberg/warehouse/"
 db = KryptonDatabase(catalog="glue_catalog", db_name="kryptosm")
 
 # When True, do NOT drop/recreate existing tables, and skip any per-type write
@@ -150,31 +150,19 @@ else:
 # ---------------------------------------------------------------------------
 logger.info("[2/8] Register input Parquet views")
 base = INPUT_PARQUET.rstrip("/")
-spark.read.parquet(f"{base}/type=node").createOrReplaceTempView("input_nodes_raw")
-spark.read.parquet(f"{base}/type=way").createOrReplaceTempView("input_ways_raw_pq")
-spark.read.parquet(f"{base}/type=relation").createOrReplaceTempView("input_relations_raw")
-# At the parquet source boundary, coerce changeset NULLs to 0 and add an
-# empty additional_changesets column. This gives every downstream view a
-# uniform shape — no special-case for first apply.
-spark.sql("""
-    SELECT * EXCEPT (changeset),
-           COALESCE(changeset, 0)         AS changeset,
-           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
-    FROM input_nodes_raw
-""").createOrReplaceTempView("input_nodes")
-spark.sql("""
-    SELECT * EXCEPT (changeset),
-           COALESCE(changeset, 0)         AS changeset,
-           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
-    FROM input_ways_raw_pq
-""").createOrReplaceTempView("input_ways_raw")
-flatten_way_refs(spark, "input_ways_raw", "input_ways")
-spark.sql("""
-    SELECT * EXCEPT (changeset),
-           COALESCE(changeset, 0)         AS changeset,
-           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
-    FROM input_relations_raw
-""").createOrReplaceTempView("input_relations")
+spark.read.parquet(f"{base}/type=node") \
+    .withColumn("changeset", coalesce(col("changeset"), lit(0))) \
+    .withColumn("additional_changesets", array().cast("array<bigint>")) \
+    .createOrReplaceTempView("input_nodes")
+spark.read.parquet(f"{base}/type=way") \
+    .withColumn("changeset", coalesce(col("changeset"), lit(0))) \
+    .withColumn("additional_changesets", array().cast("array<bigint>")) \
+    .createOrReplaceTempView("input_ways_raw_pq")
+flatten_way_refs(spark, "input_ways_raw_pq", "input_ways")
+spark.read.parquet(f"{base}/type=relation") \
+    .withColumn("changeset", coalesce(col("changeset"), lit(0))) \
+    .withColumn("additional_changesets", array().cast("array<bigint>")) \
+    .createOrReplaceTempView("input_relations")
 
 # ---------------------------------------------------------------------------
 # [3/8] Build + write nodes  (skipped on RESUME if already present)

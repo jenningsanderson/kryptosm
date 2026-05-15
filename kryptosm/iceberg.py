@@ -760,6 +760,6 @@ def merge_upsert_delete(
         ) s
         ON t.id = s.id
         WHEN MATCHED AND s.version IS NULL THEN DELETE
-        WHEN MATCHED THEN UPDATE SET *
+        WHEN MATCHED AND s.version >= t.version THEN UPDATE SET *
         WHEN NOT MATCHED AND s.version IS NOT NULL THEN INSERT *
     """)

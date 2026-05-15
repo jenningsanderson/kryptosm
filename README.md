@@ -9,15 +9,19 @@ for versioned, time-travel-capable table storage.
 
 ## The name
 
-Superman's home world was **Krypton** — a planet of ice.
+Kal-El was born on **Krypton** — a planet of ice — and sent to Earth as an
+infant. He grew up in Kansas, moved to Metropolis, and landed a job at
+**The Daily Planet**. But somewhere between saving the world and filing copy,
+Clark Kent discovered a quiet obsession: **open map data**. Every node, every
+way, every relation — the whole planet, mapped by volunteers, versioned down
+to the centimeter. He couldn't look away.
 
-The goal of this project is to build **The Daily Planet**: a continuously-updated,
-planet-scale database of every node, way, and relation on Earth, stored on
-**Apache Iceberg**. An ice database. Named after an ice planet. Built to publish
-the planet.
+He needed a database that could hold the entire planet and keep up with every
+edit, stored on **Apache Iceberg** — because of course the guy from the ice
+planet would pick the ice table format. He called it **Krypton**.
 
-The internal database is called **Krypton**; the `osm` suffix grounds it in
-OpenStreetMap. **krypt**on + **osm** = `kryptosm`.
+The `osm` suffix grounds it in **OpenStreetMap**: **krypt**on + **osm** =
+`kryptosm`. The Daily Planet, published daily.
 
 ## What it does
 

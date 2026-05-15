@@ -87,6 +87,7 @@ REGIONS = {
         parquet_path=_DATA_DIR / "WashingtonDC" / "dc.parquet",
         replication_url="https://download.geofabrik.de/north-america/us/district-of-columbia-updates/",
         driver_memory="4g",
+        parallelism=4,
     ),
     "oregon": Region(
         short_name="oregon",
