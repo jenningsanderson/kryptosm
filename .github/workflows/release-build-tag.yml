@@ -40,6 +40,12 @@ jobs:
               pyproject = Path("pyproject.toml")
               data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
               print(data["project"]["version"])
+          except KeyError:
+              print(
+                  "Version not found in pyproject.toml under project.version",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
           except Exception as exc:
               print(f"Failed to read version from pyproject.toml: {exc}", file=sys.stderr)
               raise SystemExit(1)
@@ -51,7 +57,7 @@ jobs:
       - name: Create and push version tag
         run: |
           TAG="${{ steps.metadata.outputs.tag }}"
-          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
             echo "Tag ${TAG} already exists; skipping."
             exit 0
           fi
