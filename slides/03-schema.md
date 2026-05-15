@@ -1,19 +1,41 @@
-## Table Schema
+## Database Schema
 
-One table, partitioned by `type` (`node` | `way` | `relation`):
+Three separate Iceberg tables — each tuned for its shape and row count.
 
-| Column | Type | Notes |
+<div class="two-col">
+<div markdown="1">
+
+#### `nodes` (~10B rows on planet)
+
+| Column | Type |
+|---|---|
+| `id` | `BIGINT` |
+| `version`, `timestamp`, `changeset` | OSM metadata |
+| `uid`, `user`, `tags` | OSM metadata |
+| `lat`, `lon` | `DOUBLE` |
+| `latest_ts` | `TIMESTAMP` |
+| `additional_changesets` | `ARRAY<BIGINT>` |
+| `geometry` | `BINARY` (WKB ST_Point) |
+
+No `bbox` — lat/lon already define the footprint.
+
+</div>
+<div markdown="1">
+
+#### `ways` (~1.2B rows) and `relations` (~12M rows)
+
+Type-specific columns differ:
+
+| Column | `ways` | `relations` |
 |---|---|---|
-| `id` | `BIGINT` | OSM element ID |
-| `type` | `STRING` | Partition key |
-| `version` | `BIGINT` | OSM version |
-| `timestamp` | `TIMESTAMP` | Last edit |
-| `tags` | `MAP<STRING,STRING>` | Key-value tags |
-| `geometry` | `BINARY` | WKB-encoded |
-| `bbox` | `STRUCT<xmin,xmax,ymin,ymax>` | Bounding box |
-| `latest_ts` | `TIMESTAMP` | Max ts across feature + deps |
+| type-specific | `refs ARRAY<BIGINT>` | `members ARRAY<STRUCT<type,ref,role>>` |
+| `geometry` | LineString or Polygon | MultiPolygon, MultiLineString, or NULL |
+| `bbox` | `STRUCT<xmin,xmax,ymin,ymax>` | same |
 
-Plus two index tables: **`node_to_ways`** and **`way_to_relations`** — used to find dirty dependents during incremental updates.
+`latest_ts` = MAX timestamp across the feature and all its members.
+
+</div>
+</div>
 
 Note:
-lat/lon and refs/members columns are also present for nodes and ways respectively. The geometry column stores WKB so Spark can write it as binary without a custom UDT.
+Per-type tables enable type-specific Iceberg tuning: 8 MB bloom filter budget for nodes (huge keyspace, frequent joins during way rebuilds), 1 MB for ways, 256 KB for relations (few but wide rows with large members arrays). A single unified table forces one-size-fits-all settings that hurt every type.
