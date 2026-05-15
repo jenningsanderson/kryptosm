@@ -44,8 +44,8 @@ from sedona.spark import SedonaContext
 # ---------------------------------------------------------------------------
 # Config — edit these for your environment
 # ---------------------------------------------------------------------------
-INPUT_PARQUET = "s3://meta-overture-staging/planet-iceberg/raw/"
-WAREHOUSE     = "s3://meta-overture-staging/transportation_splitter/planet-iceberg/warehouse/"
+INPUT_PARQUET = "s3://YOUR-BUCKET/osm/raw/"
+WAREHOUSE     = "s3://YOUR-BUCKET/warehouse/"
 db = KryptonDatabase(catalog="glue_catalog", db_name="kryptosm")
 
 # When True, do NOT drop/recreate existing tables, and skip any per-type write

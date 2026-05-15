@@ -22,7 +22,7 @@ from sedona.spark import SedonaContext
 # ---------------------------------------------------------------------------
 # Config — edit these for your environment
 # ---------------------------------------------------------------------------
-WAREHOUSE        = "s3://meta-overture-staging/transportation_splitter/planet-iceberg/warehouse/"
+WAREHOUSE        = "s3://YOUR-BUCKET/warehouse/"
 db = KryptonDatabase(catalog="glue_catalog", db_name="kryptosm")
 
 # /tmp on Glue is fast local SSD, wiped between runs — fine, OSC files are tiny.
