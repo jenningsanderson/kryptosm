@@ -7,6 +7,18 @@ OSC-archive tables — kept up to date with incremental OSC change files.
 Built on PySpark + Apache Sedona for geometry construction and Apache Iceberg
 for versioned, time-travel-capable table storage.
 
+## The name
+
+Superman's home world was **Krypton** — a planet of ice.
+
+The goal of this project is to build **The Daily Planet**: a continuously-updated,
+planet-scale database of every node, way, and relation on Earth, stored on
+**Apache Iceberg**. An ice database. Named after an ice planet. Built to publish
+the planet.
+
+The internal database is called **Krypton**; the `osm` suffix grounds it in
+OpenStreetMap. **krypt**on + **osm** = `kryptosm`.
+
 ## What it does
 
 1. **Initial load** — reads an OSM Parquet extract (nodes, ways, relations),
