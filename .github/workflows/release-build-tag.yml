@@ -1,0 +1,87 @@
+name: Build and Tag Distribution
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Resolve version metadata
+        id: metadata
+        run: |
+          VERSION=$(python - <<'PY'
+          import sys
+          import tomllib
+          from pathlib import Path
+          try:
+              pyproject = Path("pyproject.toml")
+              data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+              print(data["project"]["version"])
+          except KeyError:
+              print(
+                  "Version not found in pyproject.toml under project.version",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          except tomllib.TOMLDecodeError as exc:
+              print(f"Invalid TOML in pyproject.toml: {exc}", file=sys.stderr)
+              raise SystemExit(1)
+          except Exception as exc:
+              print(f"Failed to read version from pyproject.toml: {exc}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+          )
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push version tag
+        run: |
+          TAG="${{ steps.metadata.outputs.tag }}"
+          git fetch --tags --force origin
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
+            echo "Tag ${TAG} already exists; skipping."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          if PUSH_OUTPUT="$(git push origin "${TAG}" 2>&1)"; then
+            echo "${PUSH_OUTPUT}"
+            exit 0
+          fi
+          if echo "${PUSH_OUTPUT}" | grep -qiE "already exists|cannot lock ref|reference already exists"; then
+            echo "Tag ${TAG} was created by a concurrent workflow run."
+            echo "${PUSH_OUTPUT}"
+            exit 0
+          fi
+          echo "${PUSH_OUTPUT}"
+          exit 1
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kryptosm-${{ steps.metadata.outputs.version }}-dist
+          path: dist/*
