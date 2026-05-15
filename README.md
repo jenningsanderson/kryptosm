@@ -37,11 +37,6 @@ The `osm` suffix grounds it in **OpenStreetMap**: **krypt**on + **osm** =
    per-type tables. Each OSC file produces its own Iceberg snapshot per
    table, so each table's history steps through every change.
 
-3. **Inspection** — compares Iceberg snapshots per table to produce GeoJSON +
-   interactive HTML maps showing what changed: geometry diffs, tag diffs,
-   added/modified/deleted features with `@valid_since` / `@valid_until`
-   timestamps.
-
 ## Tenets
 
 - **Everything is SQL.** Business logic lives in SQL strings that build temp
@@ -224,14 +219,6 @@ while path := next_osc_path(spark, NODES, WAYS, RELATIONS, ARCHIVE,
               ARCHIVE)
 ```
 
-### Inspect changes
-
-```python
-# Inspect runs per per-type table.
-inspect_snapshots(spark, RELATIONS, "relation", "./output")
-# Produces .geojson files + inspector_relation.html (MapLibre GL JS timeline viewer)
-```
-
 ## Repository layout
 
 ```
@@ -240,21 +227,19 @@ kryptosm/
     iceberg.py           — CREATE / MERGE / DELETE, index table operations
     osc.py               — OSC parsing, fetch (next_osc_path), apply (apply_osc)
     replication.py       — Geofabrik OSC download via pyosmium
-    inspect.py           — snapshot diff → GeoJSON + HTML map viewer
     geometry/
         nodes.py         — ST_Point per node
         ways.py          — LineString / Polygon per way
         relations.py     — MultiPolygon / MultiLineString per relation
         osc_apply.py     — dirty-set computation using index tables
         iceberg_prep.py  — geom → WKB + bbox for Iceberg write
-        samples.py       — GeoJSON sample writer for manual inspection
+        samples.py       — GeoJSON sample writer
 
 tests/
     __init__.py              — Spark session factory for tests
     test_e2e_init.py         — build table from Parquet
     test_e2e_osc.py          — fetch + apply the next OSC (idempotent)
     test_e2e_osc_all.py      — fetch + apply all pending OSCs
-    test_inspect.py          — snapshot inspector
     test_replication.py      — replication unit + live tests
     data/WashingtonDC/       — DC OSM extract as Parquet
 ```
@@ -266,7 +251,6 @@ uv sync                    # install dependencies
 make test-e2e-init         # build the table from DC Parquet extract
 make test-e2e-osc          # fetch + apply the next pending OSC
 make test-e2e-osc-all      # fetch + apply all pending OSCs
-make test-inspect          # run the snapshot inspector
 ```
 
 `test-e2e-osc` is idempotent: run it repeatedly and each invocation
@@ -304,14 +288,14 @@ OSC XML → parse → dedup (latest version per id+type)
 ## Dependencies
 
 - `pyspark==3.5.0`
-- `apache-sedona==1.8.1`
+- `apache-sedona==1.9.0`
 - `osmium>=4.0.0`
 - `boto3>=1.35.47` (for S3/Glue catalog)
 - `requests>=2.28.0`
 
 JARs (auto-cached at `~/.cache/kryptosm/jars/`):
 
-- `sedona-spark-shaded-3.5_2.12-1.8.1.jar`
+- `sedona-spark-shaded-3.5_2.12-1.9.0.jar`
 - `iceberg-spark-runtime-3.5_2.12-1.6.1.jar`
 - `iceberg-aws-bundle-1.6.1.jar`
 

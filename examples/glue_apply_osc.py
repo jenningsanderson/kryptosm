@@ -51,8 +51,6 @@ logger.info("  replication: %s", REPLICATION_URL)
 # ---------------------------------------------------------------------------
 spark = SedonaContext.create(
     SparkSession.builder.appName(f"kryptosm-osc-{db.db_name}")
-    .config("spark.driver.extraJavaOptions", "-Djts.overlay=ng")
-    .config("spark.executor.extraJavaOptions", "-Djts.overlay=ng")
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
     .config("spark.kryo.registrator", "org.apache.sedona.core.serde.SedonaKryoRegistrator")
     .config(
@@ -67,15 +65,6 @@ spark = SedonaContext.create(
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     .getOrCreate()
 )
-
-_jts_overlay = spark.sparkContext._jvm.System.getProperty("jts.overlay")
-logger.info("jts.overlay (driver) = %r  (expect 'ng')", _jts_overlay)
-if _jts_overlay != "ng":
-    logger.warning(
-        "jts.overlay is not 'ng' on the driver — set it via Glue job param "
-        "`--conf spark.driver.extraJavaOptions=-Djts.overlay=ng` "
-        "(and the executor equivalent). OSC apply may fail on relations."
-    )
 
 # ---------------------------------------------------------------------------
 # Verify the per-type tables exist (init must have run first)

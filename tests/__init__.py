@@ -141,8 +141,6 @@ def create_spark_session_for_testing(
     builder = (
         SparkSession.builder.appName("KryptOSM Test")
         .master(f"local[{parallelism}]")
-        .config("spark.driver.extraJavaOptions", "-Djts.overlay=ng")
-        .config("spark.executor.extraJavaOptions", "-Djts.overlay=ng")
         .config("sedona.join.numpartition", "4000")
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.kryo.registrator", "org.apache.sedona.core.serde.SedonaKryoRegistrator")

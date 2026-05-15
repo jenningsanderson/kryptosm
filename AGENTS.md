@@ -41,7 +41,6 @@ kryptosm/
 │   ├── iceberg.py               # CREATE / MERGE / DELETE, index tables, maintenance
 │   ├── osc.py                   # OSC parsing, fetch (next_osc_path), apply (apply_osc)
 │   ├── replication.py           # Geofabrik OSC download via pyosmium
-│   ├── inspect.py               # snapshot diff → GeoJSON + HTML map viewer
 │   └── geometry/                # the SQL pipeline, one stage per file
 │       ├── __init__.py
 │       ├── nodes.py             # Point per OSM node
@@ -55,7 +54,6 @@ kryptosm/
     ├── test_e2e_init.py         # Build table from Parquet
     ├── test_e2e_osc.py          # Fetch + apply next pending OSC (idempotent)
     ├── test_e2e_osc_all.py      # Fetch + apply all pending OSCs
-    ├── test_inspect.py          # Snapshot inspector
     ├── test_replication.py      # Replication unit + live tests
     └── data/
         ├── WashingtonDC/
@@ -191,17 +189,6 @@ Geofabrik OSC replication downloads using pyosmium's `ReplicationServer`.
 `fetch_osc_files()` downloads pending `.osc.gz` files given a last-applied sequence
 or table timestamp.
 
-### `inspect.py`
-
-Snapshot inspector. Compares two Iceberg snapshots via a FULL OUTER JOIN
-on `(id, type)` and generates GeoJSON + an interactive HTML map viewer
-(MapLibre GL JS with a timeline slider). Key functions:
-
-- `list_snapshots(spark, table_name)` - query the `.snapshots` metadata table.
-- `diff_snapshots(spark, table_name, before, after)` - collect changed rows.
-- `inspect_snapshots(spark, table_name, output_dir, ...)` - orchestrate
-  one or more diffs, write `.geojson` files and `inspector.html`.
-
 ## Iceberg table schema
 
 ```sql
@@ -255,7 +242,6 @@ run any stage standalone once its predecessors have run.
 ```bash
 make test-e2e-init           # build table from Parquet
 make test-e2e-fetch-and-apply # fetch OSC from Geofabrik + apply (network)
-make test-inspect            # snapshot inspector
 ```
 
 ## Common changes
@@ -283,13 +269,13 @@ story - we recreate the table.
 Pinned in `pyproject.toml`:
 
 - `pyspark==3.5.0`
-- `apache-sedona==1.8.1`
+- `apache-sedona==1.9.0`
 - `boto3>=1.35.47`
 - `requests>=2.28.0`
 
 JARs auto-cached at `~/.cache/kryptosm/jars/`:
 
-- `sedona-spark-shaded-3.5_2.12-1.8.1.jar`
+- `sedona-spark-shaded-3.5_2.12-1.9.0.jar`
 - `iceberg-spark-runtime-3.5_2.12-1.6.1.jar`
 - `iceberg-aws-bundle-1.6.1.jar`
 

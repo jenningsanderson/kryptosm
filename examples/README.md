@@ -80,11 +80,8 @@ Note that the value **starts directly with the first key=value** (no leading
 `--conf`) and uses `--conf` as the separator from the second pair onward.
 This is AWS Glue's convention, not standard Spark CLI.
 
-> ℹ️ **No `extraJavaOptions` needed.** With Sedona 1.9+ / JTS 1.20+, the
-> robust OverlayNG engine is the default. Earlier versions required
-> `-Djts.overlay=ng` — that flag (and the `extraJavaOptions` it travels with)
-> is also blocked by Glue 5.0's job-parameter validator, which is why
-> upgrading Sedona is the cleaner fix here.
+> ℹ️ **No `extraJavaOptions` needed.** Sedona 1.9+ bundles JTS 1.20+ where
+> the robust OverlayNG engine is the default.
 
 ### After it runs
 
