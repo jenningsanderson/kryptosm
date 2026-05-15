@@ -57,12 +57,17 @@ jobs:
       - name: Create and push version tag
         run: |
           TAG="${{ steps.metadata.outputs.tag }}"
+          git fetch --tags --force origin
           if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
             echo "Tag ${TAG} already exists; skipping."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "Local tag ${TAG} already exists; skipping creation."
+            exit 0
+          fi
           git tag -a "${TAG}" -m "Release ${TAG}"
           git push origin "${TAG}" || echo "Tag ${TAG} was created by a concurrent workflow run."
 
