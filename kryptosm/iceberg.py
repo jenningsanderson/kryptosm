@@ -730,32 +730,31 @@ def get_min_applied_sequence(
 # MERGE / DELETE
 # ---------------------------------------------------------------------------
 
-def merge_into_table(
+def merge_upsert_delete(
     spark: SparkSession,
     table_name: str,
-    source_view: str,
-    match_condition: str,
+    upsert_view: str,
+    delete_view: str,
 ):
-    """MERGE source_view into table_name (upsert by match_condition)."""
+    """Upsert + delete in a single MERGE, halving the Iceberg operations.
+
+    Delete rows are padded with NULLs and routed to the DELETE clause via
+    a ``version IS NULL`` sentinel (real upserts always have a version).
+    """
+    cols = spark.table(table_name).columns
+    null_selects = ", ".join(
+        "d.id" if c == "id" else f"NULL AS {c}"
+        for c in cols
+    )
     spark.sql(f"""
         MERGE INTO {table_name} t
-        USING {source_view} s
-        ON {match_condition}
-        WHEN MATCHED     THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
-    """)
-
-
-def delete_from_table(
-    spark: SparkSession,
-    table_name: str,
-    source_view: str,
-    match_condition: str,
-):
-    """Delete rows from table_name where match_condition holds against source_view."""
-    spark.sql(f"""
-        MERGE INTO {table_name} t
-        USING {source_view} s
-        ON {match_condition}
-        WHEN MATCHED THEN DELETE
+        USING (
+            SELECT * FROM {upsert_view}
+            UNION ALL
+            SELECT {null_selects} FROM {delete_view} d
+        ) s
+        ON t.id = s.id
+        WHEN MATCHED AND s.version IS NULL THEN DELETE
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED AND s.version IS NOT NULL THEN INSERT *
     """)

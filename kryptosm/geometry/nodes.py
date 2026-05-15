@@ -13,21 +13,24 @@ def build_node_geometry(spark: SparkSession, nodes_data: str, result_view: str):
     Project an OSM node onto an ST_Point.
 
     Input view (`nodes_data`) columns:
-        id, version, timestamp, uid, user, changeset, tags, lat, lon
+        id, version, timestamp, uid, user, changeset, tags, lat, lon,
+        additional_changesets (optional ARRAY<BIGINT>; defaulted when missing)
         (extra columns like `members`/`refs` are tolerated but ignored —
          OSC records carry them as NULLs for nodes)
 
     Output view (`result_view`) columns:
         id, version (BIGINT), timestamp (TIMESTAMP), uid (BIGINT), user,
         changeset (BIGINT), tags, lat, lon, latest_ts (TIMESTAMP),
-        additional_changesets (empty ARRAY<BIGINT>), geom (ST_Point)
+        additional_changesets (ARRAY<BIGINT>), geom (ST_Point)
 
     Why:
         - Coordinates are reduced to 7 decimal places (~1cm at the equator)
           to match OSM's storage precision and stabilize downstream joins.
         - Rows with NULL lat/lon are silently dropped (deleted nodes).
-        - Nodes have no children, so ``additional_changesets`` is always
-          an empty array.
+        - ``additional_changesets`` is passed through from the input. Nodes
+          have no children, so the array reflects only direct edits to this
+          node — OSC-dedup losers (multiple versions for the same id in one
+          OSC file) and prior-apply carry-forward unioned in upstream.
         - ``latest_ts`` is the feature's own ``timestamp``. We never
           fall back to wall-clock — feature temporal data must come from
           OSM (base or OSC), never from ``current_timestamp()``.
@@ -43,7 +46,9 @@ def build_node_geometry(spark: SparkSession, nodes_data: str, result_view: str):
                lat,
                lon,
                CAST(timestamp AS TIMESTAMP)         AS latest_ts,
-               CAST(array() AS ARRAY<BIGINT>)       AS additional_changesets,
+               COALESCE(additional_changesets,
+                        CAST(array() AS ARRAY<BIGINT>))
+                                                     AS additional_changesets,
                ST_ReducePrecision(ST_Point(lon, lat), 7) AS geom
         FROM {nodes_data}
         WHERE lat IS NOT NULL AND lon IS NOT NULL

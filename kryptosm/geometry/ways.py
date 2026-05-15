@@ -56,7 +56,8 @@ def build_way_linestrings(
     Build a LineString per way by collecting its node geometries in order.
 
     Input view (`ways_data`) columns:
-        id, version, timestamp, uid, user, changeset, tags, refs (ARRAY<BIGINT>)
+        id, version, timestamp, uid, user, changeset, tags, refs (ARRAY<BIGINT>),
+        additional_changesets (optional ARRAY<BIGINT>; defaulted when missing)
         (extra columns are tolerated but ignored)
     Input view (`nodes_geometry`) columns:
         id, latest_ts, changeset, geom (ST_Point)
@@ -74,15 +75,27 @@ def build_way_linestrings(
         - A way needs >= 2 distinct nodes to form a line; otherwise geom is NULL.
         - We trust the input data: OSM ways do not contain adjacent duplicate
           node refs, so we don't pay for window-function dedup here.
+        - ``additional_changesets`` unions two independent sources:
+          (1) the input row's already-accumulated array — direct edits to
+              this way (OSC-dedup losers + prior-apply carry-forward),
+              passed through unfiltered;
+          (2) member-node changesets STRICTLY greater than ``a.changeset`` —
+              child changesets that postdate this way's last edit. The
+              "> self.changeset" filter bounds that side from growing
+              unboundedly over the way's lifetime.
     """
     spark.sql(f"""
         SELECT
             a.id, a.version, a.timestamp, a.uid, a.user, a.changeset, a.tags,
             a.refs,
             GREATEST(a.timestamp, b.latest_ts) AS latest_ts,
-            COALESCE(
-                filter(b.member_changesets, x -> x > a.changeset),
-                CAST(array() AS ARRAY<BIGINT>)
+            array_distinct(
+                array_union(
+                    COALESCE(a.additional_changesets,
+                             CAST(array() AS ARRAY<BIGINT>)),
+                    COALESCE(filter(b.member_changesets, x -> x > a.changeset),
+                             CAST(array() AS ARRAY<BIGINT>))
+                )
             ) AS additional_changesets,
             IF (
                 b.node_geom IS NOT NULL AND cardinality(b.node_geom) > 1,

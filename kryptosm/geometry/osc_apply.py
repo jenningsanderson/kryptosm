@@ -33,6 +33,11 @@ def all_dirty_ways(
 
     Uses the ``node_to_ways`` index table instead of exploding every way's refs.
     The FULL OUTER JOIN is small: both sides contain only dirty features.
+
+    ``additional_changesets`` is carry-forwarded across applies: the OSC-side
+    array (containing OSC-dedup losers from this OSC file) is unioned with the
+    base-row array (the historical accumulation from prior applies) so a
+    re-MERGE'd row preserves every previously-stored changeset.
     """
     spark.sql(f"""
         SELECT
@@ -44,13 +49,23 @@ def all_dirty_ways(
             COALESCE(a.changeset, b.changeset) AS changeset,
             COALESCE(a.tags, b.tags)           AS tags,
             COALESCE(a.refs, b.refs)           AS refs,
-            COALESCE(a.latest_ts, b.latest_ts) AS latest_ts
+            COALESCE(a.latest_ts, b.latest_ts) AS latest_ts,
+            array_distinct(
+                array_union(
+                    COALESCE(a.additional_changesets,
+                             CAST(array() AS ARRAY<BIGINT>)),
+                    COALESCE(b.additional_changesets,
+                             CAST(array() AS ARRAY<BIGINT>))
+                )
+            ) AS additional_changesets
         FROM (
-            SELECT id, version, timestamp, uid, user, changeset, tags, refs, latest_ts
+            SELECT id, version, timestamp, uid, user, changeset, tags, refs,
+                   latest_ts, additional_changesets
             FROM {osc_way_upserts}
         ) a
         FULL OUTER JOIN (
-            SELECT id, version, timestamp, uid, user, changeset, tags, refs, latest_ts
+            SELECT id, version, timestamp, uid, user, changeset, tags, refs,
+                   latest_ts, additional_changesets
             FROM {base_ways}
             WHERE id IN (
                 SELECT DISTINCT way_id
@@ -127,15 +142,24 @@ def all_dirty_relations(
             COALESCE(a.changeset, b.changeset) AS changeset,
             COALESCE(a.tags, b.tags)           AS tags,
             COALESCE(a.members, b.members)     AS members,
-            COALESCE(a.latest_ts, b.latest_ts) AS latest_ts
+            COALESCE(a.latest_ts, b.latest_ts) AS latest_ts,
+            array_distinct(
+                array_union(
+                    COALESCE(a.additional_changesets,
+                             CAST(array() AS ARRAY<BIGINT>)),
+                    COALESCE(b.additional_changesets,
+                             CAST(array() AS ARRAY<BIGINT>))
+                )
+            ) AS additional_changesets
         FROM (
-            SELECT id, version, timestamp, uid, user, changeset, tags, members, latest_ts
+            SELECT id, version, timestamp, uid, user, changeset, tags, members,
+                   latest_ts, additional_changesets
             FROM {osc_relation_upserts}
         ) a
         FULL OUTER JOIN (
             SELECT
                 rel.id, rel.version, rel.timestamp, rel.uid, rel.user, rel.changeset,
-                rel.tags, rel.members, rel.latest_ts
+                rel.tags, rel.members, rel.latest_ts, rel.additional_changesets
             FROM {base_relations} rel
             WHERE {widen_clause}
         ) b ON a.id = b.id

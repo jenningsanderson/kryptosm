@@ -7,9 +7,8 @@ Set KRYPTOSM_REGION=oregon to use Oregon data (default: dc).
 
 from kryptosm import (
     TableConfig,
-    build_way_linestrings,
     build_node_geometry,
-    promote_closed_ways_to_areas,
+    build_way_linestrings,
     construct_multipolygon,
     create_index_tables,
     create_nodes_table,
@@ -24,6 +23,7 @@ from kryptosm import (
     populate_relation_to_relations,
     populate_way_to_relations,
     prepare_for_iceberg,
+    promote_closed_ways_to_areas,
     relation_merge_geometry_data,
     relations_need_geometry,
 )
@@ -75,15 +75,39 @@ def test_init():
 
         with stage("Register input Parquet views"):
             spark.read.parquet(str(region.parquet_path / "type=node")).createOrReplaceTempView(
-                "input_nodes"
+                "input_nodes_raw"
             )
             spark.read.parquet(str(region.parquet_path / "type=way")).createOrReplaceTempView(
-                "input_ways_raw"
+                "input_ways_raw_pq"
             )
-            flatten_way_refs(spark, "input_ways_raw", "input_ways")
             spark.read.parquet(str(region.parquet_path / "type=relation")).createOrReplaceTempView(
-                "input_relations"
+                "input_relations_raw"
             )
+            # At the parquet source boundary, coerce changeset NULLs to 0 and
+            # add an empty additional_changesets column. This gives every
+            # downstream view a uniform shape — no special-case for first apply.
+            spark.sql("""
+                SELECT id, tags, lat, lon, nds, members,
+                       COALESCE(changeset, 0)         AS changeset,
+                       timestamp, uid, user, version, visible,
+                       CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
+                FROM input_nodes_raw
+            """).createOrReplaceTempView("input_nodes")
+            spark.sql("""
+                SELECT id, tags, lat, lon, nds, members,
+                       COALESCE(changeset, 0)         AS changeset,
+                       timestamp, uid, user, version, visible,
+                       CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
+                FROM input_ways_raw_pq
+            """).createOrReplaceTempView("input_ways_raw")
+            flatten_way_refs(spark, "input_ways_raw", "input_ways")
+            spark.sql("""
+                SELECT id, tags, lat, lon, nds, members,
+                       COALESCE(changeset, 0)         AS changeset,
+                       timestamp, uid, user, version, visible,
+                       CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
+                FROM input_relations_raw
+            """).createOrReplaceTempView("input_relations")
 
         with stage("Build + write nodes"):
             build_node_geometry(spark, "input_nodes", "nodes_with_geom")

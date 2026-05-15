@@ -16,9 +16,8 @@ import sys
 from kryptosm import (
     KryptonDatabase,
     TableConfig,
-    build_way_linestrings,
     build_node_geometry,
-    promote_closed_ways_to_areas,
+    build_way_linestrings,
     construct_multipolygon,
     create_index_tables,
     create_nodes_table,
@@ -33,6 +32,7 @@ from kryptosm import (
     populate_relation_to_relations,
     populate_way_to_relations,
     prepare_for_iceberg,
+    promote_closed_ways_to_areas,
     relation_merge_geometry_data,
     relations_need_geometry,
 )
@@ -150,10 +150,31 @@ else:
 # ---------------------------------------------------------------------------
 logger.info("[2/8] Register input Parquet views")
 base = INPUT_PARQUET.rstrip("/")
-spark.read.parquet(f"{base}/type=node").createOrReplaceTempView("input_nodes")
-spark.read.parquet(f"{base}/type=way").createOrReplaceTempView("input_ways_raw")
+spark.read.parquet(f"{base}/type=node").createOrReplaceTempView("input_nodes_raw")
+spark.read.parquet(f"{base}/type=way").createOrReplaceTempView("input_ways_raw_pq")
+spark.read.parquet(f"{base}/type=relation").createOrReplaceTempView("input_relations_raw")
+# At the parquet source boundary, coerce changeset NULLs to 0 and add an
+# empty additional_changesets column. This gives every downstream view a
+# uniform shape — no special-case for first apply.
+spark.sql("""
+    SELECT * EXCEPT (changeset),
+           COALESCE(changeset, 0)         AS changeset,
+           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
+    FROM input_nodes_raw
+""").createOrReplaceTempView("input_nodes")
+spark.sql("""
+    SELECT * EXCEPT (changeset),
+           COALESCE(changeset, 0)         AS changeset,
+           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
+    FROM input_ways_raw_pq
+""").createOrReplaceTempView("input_ways_raw")
 flatten_way_refs(spark, "input_ways_raw", "input_ways")
-spark.read.parquet(f"{base}/type=relation").createOrReplaceTempView("input_relations")
+spark.sql("""
+    SELECT * EXCEPT (changeset),
+           COALESCE(changeset, 0)         AS changeset,
+           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
+    FROM input_relations_raw
+""").createOrReplaceTempView("input_relations")
 
 # ---------------------------------------------------------------------------
 # [3/8] Build + write nodes  (skipped on RESUME if already present)

@@ -307,10 +307,14 @@ def relation_merge_geometry_data(
     from whatever member way/node geometries are available, giving them a
     meaningful bbox.
 
-    Also computes ``additional_changesets`` — the set of changesets from each
-    direct way/node member (minus the relation's own changeset). Sub-relation
-    members are not recursed; their own changesets are reachable via their
-    own ``additional_changesets`` columns.
+    Also computes ``additional_changesets`` — the union of:
+      (1) the input relation row's already-accumulated array (direct edits to
+          this relation: OSC-dedup losers + prior-apply carry-forward), and
+      (2) member-way / member-node changesets STRICTLY greater than the
+          relation's own changeset (child changesets that postdate this
+          relation's last edit; the "> self" filter bounds growth over time).
+    Sub-relation members are not recursed; their own changesets are reachable
+    via their own ``additional_changesets`` columns.
     """
     if ways_geometry:
         # Only compute fallback for relations that construct_multipolygon
@@ -399,17 +403,27 @@ def relation_merge_geometry_data(
             GROUP BY relation_id
         """).createOrReplaceTempView("_rel_member_changesets")
         cs_join = "LEFT OUTER JOIN _rel_member_changesets c ON a.id = c.relation_id"
-        # Only retain member changesets STRICTLY greater than self.changeset.
-        # Older child changesets are already implicit at the time of the
-        # parent's last edit, so they don't add attribution information; this
-        # also bounds the column from growing unboundedly over time.
+        # Union the input relation's already-accumulated additional_changesets
+        # (direct edits: OSC-dedup losers + prior-apply carry-forward, passed
+        # through unfiltered) with member changesets STRICTLY greater than the
+        # relation's own changeset. The "> self.changeset" filter on the
+        # member-derived side keeps that side bounded — older child
+        # changesets are already implicit at the time of the relation's last
+        # edit, so they don't add attribution information.
         cs_expr = (
-            "COALESCE(filter(c.member_changesets, x -> x > a.changeset),\n"
-            "                     CAST(array() AS ARRAY<BIGINT>))"
+            "array_distinct(array_union(\n"
+            "                COALESCE(a.additional_changesets,\n"
+            "                         CAST(array() AS ARRAY<BIGINT>)),\n"
+            "                COALESCE(filter(c.member_changesets, x -> x > a.changeset),\n"
+            "                         CAST(array() AS ARRAY<BIGINT>))\n"
+            "            ))"
         )
     else:
         cs_join = ""
-        cs_expr = "CAST(array() AS ARRAY<BIGINT>)"
+        cs_expr = (
+            "COALESCE(a.additional_changesets,\n"
+            "                 CAST(array() AS ARRAY<BIGINT>))"
+        )
 
     spark.sql(f"""
         SELECT

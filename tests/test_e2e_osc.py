@@ -103,6 +103,88 @@ def test_apply_next_osc():
                 f"Expected osc_archive to contain rows for sequence {seq_after}"
             )
 
+        # No row in any per-type table should have a NULL changeset. The OSC
+        # parser coerces missing changeset attributes to 0, the parquet init
+        # path does the same, and osc_dedup defensively COALESCEs to 0 too.
+        with stage("Assert no NULL changesets in per-type tables"):
+            for kind, t in (
+                ("nodes", region.nodes_table),
+                ("ways", region.ways_table),
+                ("relations", region.relations_table),
+            ):
+                n_null = spark.sql(
+                    f"SELECT COUNT(*) AS n FROM {t} WHERE changeset IS NULL"
+                ).collect()[0]["n"]
+                print(f"  rows with NULL changeset in {kind}: {n_null:,}")
+                assert n_null == 0, (
+                    f"Every row in {t} should have a non-NULL changeset"
+                )
+
+        # OSC-dedup loser capture: if this OSC file contained any (id, type)
+        # with multiple version rows, the live table's row for that id should
+        # carry the loser changesets in additional_changesets, and changeset
+        # itself should match the highest-version row from that OSC.
+        if seq_after is not None:
+            with stage("Assert OSC-dedup losers landed in additional_changesets"):
+                # Find (id, type) groups in this sequence's archive partition
+                # that had >= 2 versions — these are the dedup-loser cases.
+                multi = spark.sql(f"""
+                    WITH _seq AS (
+                        SELECT id, type, version, changeset
+                        FROM {region.osc_archive}
+                        WHERE sequence = {seq_after}
+                              AND op IN ('create', 'modify')
+                    ),
+                    _grouped AS (
+                        SELECT
+                            id, type,
+                            COUNT(*) AS n_versions,
+                            MAX(version) AS max_version,
+                            collect_list(struct(version, changeset)) AS rows
+                        FROM _seq
+                        GROUP BY id, type
+                        HAVING COUNT(*) >= 2
+                    )
+                    SELECT id, type, max_version, n_versions,
+                           filter(rows, r -> r.version = max_version)[0].changeset AS winner_cs,
+                           array_distinct(
+                               transform(
+                                   filter(rows, r -> r.version <> max_version),
+                                   r -> r.changeset
+                               )
+                           ) AS loser_cs
+                    FROM _grouped
+                """).collect()
+                print(f"  multi-version (id, type) groups in seq {seq_after}: {len(multi)}")
+                for row in multi:
+                    osm_type = row["type"]
+                    table = {
+                        "node": region.nodes_table,
+                        "way": region.ways_table,
+                        "relation": region.relations_table,
+                    }[osm_type]
+                    rows = spark.sql(f"""
+                        SELECT changeset, additional_changesets
+                        FROM {table}
+                        WHERE id = {row["id"]}
+                    """).collect()
+                    if not rows:
+                        # Row may have been deleted by a later op in the OSC.
+                        continue
+                    live = rows[0]
+                    assert live["changeset"] == row["winner_cs"], (
+                        f"{osm_type} {row['id']}: live changeset "
+                        f"{live['changeset']!r} != winner {row['winner_cs']!r}"
+                    )
+                    live_extra = set(live["additional_changesets"] or [])
+                    expected_losers = set(row["loser_cs"] or [])
+                    missing = expected_losers - live_extra
+                    assert not missing, (
+                        f"{osm_type} {row['id']}: additional_changesets "
+                        f"{sorted(live_extra)!r} missing OSC losers "
+                        f"{sorted(missing)!r}"
+                    )
+
         print("=" * 70)
         for osm_type in ("node", "way", "relation"):
             b = before.get(osm_type, 0)

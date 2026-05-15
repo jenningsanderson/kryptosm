@@ -23,19 +23,15 @@ from .geometry.relations import (
     relation_merge_geometry_data,
     relations_need_geometry,
 )
-from .geometry.ways import (
-    build_way_linestrings,
-    promote_closed_ways_to_areas,
-)
+from .geometry.ways import build_way_linestrings, promote_closed_ways_to_areas
 from .iceberg import (
     append_osc_archive,
-    delete_from_table,
     get_last_applied_sequence,
     get_last_archived_sequence,
     get_min_applied_sequence,
     get_table_max_timestamp,
     load_with_geom,
-    merge_into_table,
+    merge_upsert_delete,
     refresh_node_to_relations,
     refresh_node_to_ways,
     refresh_relation_to_relations,
@@ -86,25 +82,63 @@ OSC_SCHEMA = T.StructType(
 
 
 def osc_dedup(spark: SparkSession, osc_view: str, result_view: str):
-    """Keep the latest version per (id, type) from the OSC, cast timestamps."""
+    """Keep the latest version per (id, type) from the OSC, cast timestamps.
+
+    Also captures every non-winning version's ``changeset`` into
+    ``additional_changesets`` so attribution from collapsed versions
+    isn't lost. Example: if one OSC contains node N at version 5
+    (changeset A) and version 6 (changeset B), the winner row keeps
+    changeset B and emits ``additional_changesets = [A]``.
+
+    Uses ROW_NUMBER() over (version DESC, timestamp DESC) to pick the
+    canonical winner, then aggregates losers' distinct changesets per
+    (id, type) and joins them back to the winner row.
+
+    NULL changesets in the source are coerced to ``0`` (matching the
+    convention from ``_iter_osc_records`` and OSM's anonymous edits) so
+    downstream views see no NULLs in this column.
+    """
     spark.sql(f"""
+        WITH _ranked AS (
+            SELECT
+                id, type, op, version, timestamp, uid, user,
+                COALESCE(changeset, 0) AS changeset,
+                tags, lat, lon, refs, members,
+                ROW_NUMBER() OVER (
+                    PARTITION BY id, type
+                    ORDER BY version DESC NULLS LAST,
+                             timestamp DESC NULLS LAST
+                ) AS _rn
+            FROM {osc_view}
+        ),
+        _losers AS (
+            SELECT
+                id, type,
+                array_distinct(collect_list(changeset)) AS additional_changesets
+            FROM _ranked
+            WHERE _rn > 1
+            GROUP BY id, type
+        )
         SELECT
-            id,
-            type,
-            max_by(op, version)                          AS op,
-            max(version)                                 AS version,
-            CAST(max_by(timestamp, version) AS TIMESTAMP) AS timestamp,
-            max_by(uid, version)                         AS uid,
-            max_by(user, version)                        AS user,
-            max_by(changeset, version)                   AS changeset,
-            max_by(tags, version)                        AS tags,
-            max_by(lat, version)                         AS lat,
-            max_by(lon, version)                         AS lon,
-            max_by(refs, version)                        AS refs,
-            max_by(members, version)                     AS members,
-            CAST(max_by(timestamp, version) AS TIMESTAMP) AS latest_ts
-        FROM {osc_view}
-        GROUP BY id, type
+            w.id,
+            w.type,
+            w.op,
+            w.version,
+            CAST(w.timestamp AS TIMESTAMP)               AS timestamp,
+            w.uid,
+            w.user,
+            w.changeset,
+            w.tags,
+            w.lat,
+            w.lon,
+            w.refs,
+            w.members,
+            CAST(w.timestamp AS TIMESTAMP)               AS latest_ts,
+            COALESCE(l.additional_changesets,
+                     CAST(array() AS ARRAY<BIGINT>))     AS additional_changesets
+        FROM _ranked w
+        LEFT JOIN _losers l ON w.id = l.id AND w.type = l.type
+        WHERE w._rn = 1
     """).createOrReplaceTempView(result_view)
 
 
@@ -177,7 +211,10 @@ def _iter_osc_records(file_path: str):
                 "timestamp": ts,
                 "uid": int(element.attrib["uid"]) if "uid" in element.attrib else None,
                 "user": element.attrib.get("user"),
-                "changeset": int(element.attrib["changeset"]) if "changeset" in element.attrib else None,
+                # Default missing OSC changeset to 0 so the column is never NULL
+                # downstream — matches OSM Parquet's anonymous-edit convention
+                # and lets every later "x > a.changeset" filter stay total.
+                "changeset": int(element.attrib["changeset"]) if "changeset" in element.attrib else 0,
                 "tags": tags,
                 "lat": float(element.attrib["lat"]) if tag == "node" else None,
                 "lon": float(element.attrib["lon"]) if tag == "node" else None,
@@ -288,43 +325,6 @@ def next_osc_path(
 # ---------------------------------------------------------------------------
 
 
-def _osc_section_is_redundant(
-    spark: SparkSession,
-    table_name: str,
-    upserts_view: str,
-    deletes_view: str,
-) -> bool:
-    """True if a per-type slice of the OSC has nothing new for ``table_name``.
-
-    A per-type slice has work to do iff there exists at least one record
-    that's a higher-version create/modify (or a brand-new create), or a
-    delete for an ID that currently exists. The check runs against a
-    single per-type table, so it's a single LEFT JOIN \u2014 much cheaper
-    than a 3-way UNION across the whole database.
-
-    Used as an optimization: when this returns True, the per-type apply
-    section can stamp the sequence and skip the MERGE/DELETE work entirely.
-    """
-    row = spark.sql(f"""
-        SELECT COUNT(*) AS need_apply FROM (
-            SELECT o.id
-            FROM {upserts_view} o
-            LEFT JOIN {table_name} t ON o.id = t.id
-            WHERE t.id IS NULL OR t.version < o.version
-            UNION ALL
-            SELECT o.id
-            FROM {deletes_view} o
-            JOIN {table_name} t ON o.id = t.id
-        )
-    """).collect()[0]
-    return row["need_apply"] == 0
-
-
-def _view_is_empty(spark: SparkSession, view_name: str) -> bool:
-    """Cheap LIMIT-1 emptiness check on a temp view."""
-    return spark.sql(f"SELECT 1 FROM {view_name} LIMIT 1").count() == 0
-
-
 def _classify_node_upserts(
     spark: SparkSession,
     osc_node_upserts: str,
@@ -403,24 +403,15 @@ def _apply_node_section(
 ) -> None:
     """Apply node changes, leaving a ``geom_dirty_nodes`` view for downstream.
 
-    Three paths:
+    Two paths:
       * ``nodes_done``: skip the MERGE; expose all OSC node upserts as
         geom-dirty (over-eager but correct for downstream widening, since we
         can't classify post-merge).
-      * Direct redundancy: OSC has no new node info. Stamp seq and emit an
-        empty ``geom_dirty_nodes``.
-      * Full apply: classify pre-merge, MERGE upserts, DELETE deletes, stamp.
+      * Full apply: classify pre-merge, MERGE upserts + deletes, stamp.
     """
     if nodes_done:
-        logger.info("%s: nodes already at seq %s, skipping merge", label, seq)
+        logger.info("%s: nodes already at seq %s, skipping", label, seq)
         spark.sql("SELECT * FROM osc_node_upserts").createOrReplaceTempView("geom_dirty_nodes")
-        return
-
-    if _osc_section_is_redundant(spark, nodes_table, "osc_node_upserts", "osc_node_deletes"):
-        logger.info("%s: nodes section redundant, stamping seq=%s", label, seq)
-        spark.sql("SELECT * FROM osc_node_upserts WHERE 1 = 0").createOrReplaceTempView("geom_dirty_nodes")
-        if seq is not None:
-            set_last_applied_sequence(spark, nodes_table, seq)
         return
 
     spark.sql(f"""
@@ -432,15 +423,34 @@ def _apply_node_section(
         spark, "osc_node_upserts", "base_nodes",
         "geom_dirty_nodes", "tag_only_nodes",
     )
-    # Merge ALL node upserts (including tag-only) so per-node metadata stays
-    # current. Only the geom-dirty subset propagates to parents below.
-    build_node_geometry(spark, "osc_node_upserts", "updated_nodes_geom")
+    # Carry-forward additional_changesets from the existing row before we
+    # rebuild the node geometry. Nodes don't go through all_dirty_nodes
+    # (only ways/relations have a dirty-set view), so the union has to
+    # happen explicitly here. Result: the OSC-side additional_changesets
+    # (containing OSC-dedup losers) is unioned with the previously-stored
+    # additional_changesets, so attribution accumulates monotonically across
+    # OSC applies.
+    spark.sql("""
+        SELECT
+            o.id, o.type, o.op, o.version, o.timestamp, o.uid, o.user,
+            o.changeset, o.tags, o.lat, o.lon, o.refs, o.members, o.latest_ts,
+            array_distinct(
+                array_union(
+                    COALESCE(o.additional_changesets,
+                             CAST(array() AS ARRAY<BIGINT>)),
+                    COALESCE(b.additional_changesets,
+                             CAST(array() AS ARRAY<BIGINT>))
+                )
+            ) AS additional_changesets
+        FROM osc_node_upserts o
+        LEFT JOIN base_nodes b ON o.id = b.id
+    """).createOrReplaceTempView("osc_node_upserts_carried")
+    build_node_geometry(spark, "osc_node_upserts_carried", "updated_nodes_geom")
     prepare_for_iceberg(spark, "updated_nodes_geom", "node", "nodes_iceberg")
-    merge_into_table(spark, nodes_table, "nodes_iceberg", "t.id = s.id")
-    delete_from_table(spark, nodes_table, "osc_node_deletes", "t.id = s.id")
+    merge_upsert_delete(spark, nodes_table, "nodes_iceberg", "osc_node_deletes")
     if seq is not None:
         set_last_applied_sequence(spark, nodes_table, seq)
-    logger.info("%s: nodes merged, stamped seq=%s", label, seq)
+    logger.info("%s: nodes applied, stamped seq=%s", label, seq)
 
 
 def _apply_way_section(
@@ -455,31 +465,10 @@ def _apply_way_section(
     """Apply way changes, leaving a ``dirty_ways`` view for relations widening.
 
     Reads ``geom_dirty_nodes`` from upstream.
-
-    Three paths:
-      * ``ways_done``: skip the MERGE; expose ``osc_way_upserts`` as
-        ``dirty_ways`` (over-eager).
-      * Redundant (no direct way changes AND no upstream node moves): stamp
-        seq, expose empty ``dirty_ways``.
-      * Full apply: compute dirty set with widening, MERGE, refresh index.
     """
     if ways_done:
-        logger.info("%s: ways already at seq %s, skipping merge", label, seq)
+        logger.info("%s: ways already at seq %s, skipping", label, seq)
         spark.sql("SELECT id FROM osc_way_upserts").createOrReplaceTempView("dirty_ways")
-        return
-
-    direct_redundant = _osc_section_is_redundant(
-        spark, ways_table, "osc_way_upserts", "osc_way_deletes"
-    )
-    no_node_widening = _view_is_empty(spark, "geom_dirty_nodes")
-    if direct_redundant and no_node_widening:
-        logger.info(
-            "%s: ways section redundant (no direct changes, no node widening), stamping seq=%s",
-            label, seq,
-        )
-        spark.sql("SELECT id FROM osc_way_upserts WHERE 1 = 0").createOrReplaceTempView("dirty_ways")
-        if seq is not None:
-            set_last_applied_sequence(spark, ways_table, seq)
         return
 
     load_with_geom(spark, ways_table, "base_ways")
@@ -501,14 +490,13 @@ def _apply_way_section(
     build_way_linestrings(spark, "dirty_ways", "nodes_with_geom", "dirty_ways_lines")
     promote_closed_ways_to_areas(spark, "dirty_ways_lines", "dirty_ways_geom")
     prepare_for_iceberg(spark, "dirty_ways_geom", "way", "ways_iceberg")
-    merge_into_table(spark, ways_table, "ways_iceberg", "t.id = s.id")
-    delete_from_table(spark, ways_table, "osc_way_deletes", "t.id = s.id")
+    merge_upsert_delete(spark, ways_table, "ways_iceberg", "osc_way_deletes")
 
     refresh_node_to_ways(spark, ways_table, node_to_ways, "_dirty_way_ids")
     spark.sql(f"DELETE FROM {node_to_ways} WHERE way_id IN (SELECT id FROM osc_way_deletes)")
     if seq is not None:
         set_last_applied_sequence(spark, ways_table, seq)
-    logger.info("%s: ways merged + index updated, stamped seq=%s", label, seq)
+    logger.info("%s: ways applied, stamped seq=%s", label, seq)
 
 
 def _apply_relation_section(
@@ -525,29 +513,9 @@ def _apply_relation_section(
 ) -> None:
     """Apply relation changes. Reads ``dirty_ways`` and ``geom_dirty_nodes``
     from upstream.
-
-    Three paths:
-      * ``rels_done``: skip everything.
-      * Redundant (no direct rel changes AND no upstream way / node moves):
-        stamp seq.
-      * Full apply: compute dirty set with widening, MERGE, refresh indexes.
     """
     if rels_done:
-        logger.info("%s: relations already at seq %s, skipping merge", label, seq)
-        return
-
-    direct_redundant = _osc_section_is_redundant(
-        spark, relations_table, "osc_relation_upserts", "osc_relation_deletes"
-    )
-    no_way_widening = _view_is_empty(spark, "dirty_ways")
-    no_node_widening = _view_is_empty(spark, "geom_dirty_nodes")
-    if direct_redundant and no_way_widening and no_node_widening:
-        logger.info(
-            "%s: relations section redundant (no direct, way, or node changes), stamping seq=%s",
-            label, seq,
-        )
-        if seq is not None:
-            set_last_applied_sequence(spark, relations_table, seq)
+        logger.info("%s: relations already at seq %s, skipping", label, seq)
         return
 
     load_with_geom(spark, relations_table, "base_relations")
@@ -592,8 +560,7 @@ def _apply_relation_section(
         ways_geometry="ways_with_geom", nodes_geometry="nodes_with_geom",
     )
     prepare_for_iceberg(spark, "dirty_rels_geom", "relation", "relations_iceberg")
-    merge_into_table(spark, relations_table, "relations_iceberg", "t.id = s.id")
-    delete_from_table(spark, relations_table, "osc_relation_deletes", "t.id = s.id")
+    merge_upsert_delete(spark, relations_table, "relations_iceberg", "osc_relation_deletes")
 
     refresh_way_to_relations(spark, relations_table, way_to_relations, "_dirty_rel_ids")
     spark.sql(
@@ -611,7 +578,7 @@ def _apply_relation_section(
     )
     if seq is not None:
         set_last_applied_sequence(spark, relations_table, seq)
-    logger.info("%s: relations merged + indexes updated, stamped seq=%s", label, seq)
+    logger.info("%s: relations applied, stamped seq=%s", label, seq)
 
 
 def apply_osc(
