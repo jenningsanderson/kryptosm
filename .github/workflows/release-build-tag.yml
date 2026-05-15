@@ -46,6 +46,9 @@ jobs:
                   file=sys.stderr,
               )
               raise SystemExit(1)
+          except tomllib.TOMLDecodeError as exc:
+              print(f"Invalid TOML in pyproject.toml: {exc}", file=sys.stderr)
+              raise SystemExit(1)
           except Exception as exc:
               print(f"Failed to read version from pyproject.toml: {exc}", file=sys.stderr)
               raise SystemExit(1)
@@ -69,7 +72,21 @@ jobs:
             exit 0
           fi
           git tag -a "${TAG}" -m "Release ${TAG}"
-          git push origin "${TAG}" || echo "Tag ${TAG} was created by a concurrent workflow run."
+          set +e
+          PUSH_OUTPUT="$(git push origin "${TAG}" 2>&1)"
+          PUSH_STATUS=$?
+          set -e
+          if [ "${PUSH_STATUS}" -eq 0 ]; then
+            echo "${PUSH_OUTPUT}"
+            exit 0
+          fi
+          if echo "${PUSH_OUTPUT}" | grep -qiE "already exists|cannot lock ref|reference already exists"; then
+            echo "Tag ${TAG} was created by a concurrent workflow run."
+            echo "${PUSH_OUTPUT}"
+            exit 0
+          fi
+          echo "${PUSH_OUTPUT}"
+          exit "${PUSH_STATUS}"
 
       - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
