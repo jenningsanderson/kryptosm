@@ -95,6 +95,13 @@ REGIONS = {
         driver_memory="8g",
         parallelism=4,
     ),
+    "egypt": Region(
+        short_name="egypt",
+        parquet_path=_DATA_DIR / "Egypt" / "egypt.parquet",
+        replication_url="https://download.geofabrik.de/africa/egypt-updates/",
+        driver_memory="8g",
+        parallelism=4,
+    ),
 }
 
 
