@@ -11,8 +11,8 @@ the **AWS Glue Data Catalog** + **S3**.
 Both scripts have a small `Config` block at the top — edit the constants there
 for your environment. The defaults point at:
 
-- Input parquet: `s3://meta-overture-staging/planet-iceberg/raw/`
-- Warehouse: `s3://meta-overture-staging/planet-iceberg/warehouse/`
+- Input parquet: `s3://YOUR-BUCKET/osm/raw/`
+- Warehouse: `s3://YOUR-BUCKET/warehouse/`
 - Glue database: `daily_planet`
 - Tables: `glue_catalog.daily_planet.osm`, `.node_to_ways`, `.way_to_relations`
 
@@ -73,18 +73,15 @@ format produces `IllegalArgumentException: Invalid input to --conf`.
 Paste this whole thing as the single value of the one `--conf` parameter:
 
 ```text
-spark.serializer=org.apache.spark.serializer.KryoSerializer --conf spark.kryo.registrator=org.apache.sedona.core.serde.SedonaKryoRegistrator --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.sedona.viz.sql.SedonaVizExtensions,org.apache.sedona.sql.SedonaSqlExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.catalog.glue_catalog.warehouse=s3://meta-overture-staging/transportation_splitter/planet-iceberg/warehouse/
+spark.serializer=org.apache.spark.serializer.KryoSerializer --conf spark.kryo.registrator=org.apache.sedona.core.serde.SedonaKryoRegistrator --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.sedona.viz.sql.SedonaVizExtensions,org.apache.sedona.sql.SedonaSqlExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.catalog.glue_catalog.warehouse=s3://YOUR-BUCKET/warehouse/
 ```
 
 Note that the value **starts directly with the first key=value** (no leading
 `--conf`) and uses `--conf` as the separator from the second pair onward.
 This is AWS Glue's convention, not standard Spark CLI.
 
-> ℹ️ **No `extraJavaOptions` needed.** With Sedona 1.9+ / JTS 1.20+, the
-> robust OverlayNG engine is the default. Earlier versions required
-> `-Djts.overlay=ng` — that flag (and the `extraJavaOptions` it travels with)
-> is also blocked by Glue 5.0's job-parameter validator, which is why
-> upgrading Sedona is the cleaner fix here.
+> ℹ️ **No `extraJavaOptions` needed.** Sedona 1.9+ bundles JTS 1.20+ where
+> the robust OverlayNG engine is the default.
 
 ### After it runs
 

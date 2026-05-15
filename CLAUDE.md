@@ -13,5 +13,5 @@ test suite is E2E with Spark+Iceberg and takes too long for iterative feedback.
 - **Package:** `kryptosm/` — OSM data → Apache Iceberg tables via Spark + Sedona
 - **All business logic is SQL** — no pandas, no Python UDFs
 - **Pipeline pattern:** chain `createOrReplaceTempView` calls; Spark materializes only at write/MERGE
-- **Dependencies:** pyspark 3.5.0, apache-sedona 1.8.1, osmium, pandas (transitive for Sedona)
+- **Dependencies:** pyspark 3.5.0, apache-sedona 1.9.0, osmium, pandas (transitive for Sedona)
 - **Build/run:** `uv sync` to install, `uv run pytest` to test

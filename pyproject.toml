@@ -22,7 +22,7 @@ classifiers = [
 
 dependencies = [
     "pyspark==3.5.0",
-    "apache-sedona==1.8.1",
+    "apache-sedona==1.9.0",
     "osmium>=4.0.0",
     "pandas",
 ]

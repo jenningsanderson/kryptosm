@@ -7,6 +7,22 @@ OSC-archive tables — kept up to date with incremental OSC change files.
 Built on PySpark + Apache Sedona for geometry construction and Apache Iceberg
 for versioned, time-travel-capable table storage.
 
+## The name
+
+Kal-El was born on **Krypton** — a planet of ice — and sent to Earth as an
+infant. He grew up in Kansas, moved to Metropolis, and landed a job at
+**The Daily Planet**. But somewhere between saving the world and filing copy,
+Clark Kent discovered a quiet obsession: **open map data**. Every node, every
+way, every relation — the whole planet, mapped by volunteers, versioned down
+to the centimeter. He couldn't look away.
+
+He needed a database that could hold the entire planet and keep up with every
+edit, stored on **Apache Iceberg** — because of course the guy from the ice
+planet would pick the ice table format. He called it **Krypton**.
+
+The `osm` suffix grounds it in **OpenStreetMap**: **krypt**on + **osm** =
+`kryptosm`. The Daily Planet, published daily.
+
 ## What it does
 
 1. **Initial load** — reads an OSM Parquet extract (nodes, ways, relations),
@@ -20,11 +36,6 @@ for versioned, time-travel-capable table storage.
    gets its geometry rebuilt), and MERGEs the changes into the relevant
    per-type tables. Each OSC file produces its own Iceberg snapshot per
    table, so each table's history steps through every change.
-
-3. **Inspection** — compares Iceberg snapshots per table to produce GeoJSON +
-   interactive HTML maps showing what changed: geometry diffs, tag diffs,
-   added/modified/deleted features with `@valid_since` / `@valid_until`
-   timestamps.
 
 ## Tenets
 
@@ -168,8 +179,9 @@ spark.sql("SELECT * FROM nodes_final").writeTo(NODES).using("iceberg").append()
 load_with_geom(spark, NODES, "nodes_with_geom")
 
 # Ways
-build_linestring_for_ways(spark, "input_ways", "nodes_with_geom", "ways_lines")
-build_ways_geometry_from_linestring(spark, "ways_lines", "ways_with_geom")
+flatten_way_refs(spark, "input_ways_raw", "input_ways")
+build_way_linestrings(spark, "input_ways", "nodes_with_geom", "ways_lines")
+promote_closed_ways_to_areas(spark, "ways_lines", "ways_with_geom")
 prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final")
 spark.sql("SELECT * FROM ways_final").writeTo(WAYS).using("iceberg").append()
 load_with_geom(spark, WAYS, "ways_with_geom")
@@ -207,14 +219,6 @@ while path := next_osc_path(spark, NODES, WAYS, RELATIONS, ARCHIVE,
               ARCHIVE)
 ```
 
-### Inspect changes
-
-```python
-# Inspect runs per per-type table.
-inspect_snapshots(spark, RELATIONS, "relation", "./output")
-# Produces .geojson files + inspector_relation.html (MapLibre GL JS timeline viewer)
-```
-
 ## Repository layout
 
 ```
@@ -223,23 +227,19 @@ kryptosm/
     iceberg.py           — CREATE / MERGE / DELETE, index table operations
     osc.py               — OSC parsing, fetch (next_osc_path), apply (apply_osc)
     replication.py       — Geofabrik OSC download via pyosmium
-    inspect.py           — snapshot diff → GeoJSON + HTML map viewer
     geometry/
         nodes.py         — ST_Point per node
         ways.py          — LineString / Polygon per way
         relations.py     — MultiPolygon / MultiLineString per relation
         osc_apply.py     — dirty-set computation using index tables
         iceberg_prep.py  — geom → WKB + bbox for Iceberg write
+        samples.py       — GeoJSON sample writer
 
 tests/
     __init__.py              — Spark session factory for tests
     test_e2e_init.py         — build table from Parquet
     test_e2e_osc.py          — fetch + apply the next OSC (idempotent)
     test_e2e_osc_all.py      — fetch + apply all pending OSCs
-    test_inspect.py          — snapshot inspector
-    test_e2e_nodes.py        — stage 1: nodes only
-    test_e2e_ways.py         — stage 2: ways only
-    test_e2e_relations.py    — stage 3: relations only
     test_replication.py      — replication unit + live tests
     data/WashingtonDC/       — DC OSM extract as Parquet
 ```
@@ -251,7 +251,6 @@ uv sync                    # install dependencies
 make test-e2e-init         # build the table from DC Parquet extract
 make test-e2e-osc          # fetch + apply the next pending OSC
 make test-e2e-osc-all      # fetch + apply all pending OSCs
-make test-inspect          # run the snapshot inspector
 ```
 
 `test-e2e-osc` is idempotent: run it repeatedly and each invocation
@@ -264,36 +263,39 @@ applies exactly one file. When the table is current, it prints
 
 ```
 Raw Parquet (type=node/way/relation)
-  ├── nodes.py     → ST_Point per node            → nodes_with_geom
-  ├── ways.py      → join refs → node geom        → ways_with_geom
-  └── relations.py → join members → way geom       → relations_with_geom
-      each → iceberg_prep.py (geom→WKB+bbox) → writeTo(iceberg)
+  ├── nodes.py     → ST_Point per node              → nodes_with_geom
+  ├── ways.py      → join refs → node geom          → ways_with_geom
+  └── relations.py → join members → way geom        → relations_with_geom
+      each → iceberg_prep.py (geom→WKB+bbox) → writeTo(per-type Iceberg table)
 ```
+
+Each step is a `createOrReplaceTempView`. Spark plans the full DAG and materializes only at `writeTo`. Between types, the pipeline re-binds from the materialized Iceberg table so downstream stages read storage rather than re-executing upstream views.
 
 ### Incremental update (per OSC file)
 
 ```
 OSC XML → parse → dedup (latest version per id+type)
 
-  ├── nodes:     build geometry → MERGE
-  ├── ways:      node_to_ways index → dirty set → build geometry → MERGE
-  └── relations: way_to_relations index → dirty set → build geometry → MERGE
+  ├── nodes:     build geometry → MERGE into nodes table
+  ├── ways:      node_to_ways index → dirty set → rebuild → MERGE into ways table
+  └── relations: way_to_relations + node_to_relations + relation_to_relations
+                 → dirty set → rebuild → MERGE into relations table
 
   Re-bind from Iceberg between types so each phase reads materialized data.
-  Update index tables after each type.
+  Update index tables after each type. Stamp last-applied-osc-sequence per table.
 ```
 
 ## Dependencies
 
 - `pyspark==3.5.0`
-- `apache-sedona==1.8.1`
+- `apache-sedona==1.9.0`
 - `osmium>=4.0.0`
 - `boto3>=1.35.47` (for S3/Glue catalog)
 - `requests>=2.28.0`
 
 JARs (auto-cached at `~/.cache/kryptosm/jars/`):
 
-- `sedona-spark-shaded-3.5_2.12-1.8.1.jar`
+- `sedona-spark-shaded-3.5_2.12-1.9.0.jar`
 - `iceberg-spark-runtime-3.5_2.12-1.6.1.jar`
 - `iceberg-aws-bundle-1.6.1.jar`
 

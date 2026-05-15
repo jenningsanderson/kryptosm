@@ -37,5 +37,4 @@ from .iceberg import (
     refresh_relation_to_relations,
     table_exists,
 )
-from .inspect import inspect_snapshots, list_snapshots
 from .osc import apply_osc, next_osc_path, read_osc_from_file

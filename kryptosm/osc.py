@@ -423,6 +423,7 @@ def _apply_node_section(
         spark, "osc_node_upserts", "base_nodes",
         "geom_dirty_nodes", "tag_only_nodes",
     )
+    logger.info("%s: classified node upserts (geom-dirty vs tag-only)", label)
     # Carry-forward additional_changesets from the existing row before we
     # rebuild the node geometry. Nodes don't go through all_dirty_nodes
     # (only ways/relations have a dirty-set view), so the union has to
@@ -447,6 +448,7 @@ def _apply_node_section(
     """).createOrReplaceTempView("osc_node_upserts_carried")
     build_node_geometry(spark, "osc_node_upserts_carried", "updated_nodes_geom")
     prepare_for_iceberg(spark, "updated_nodes_geom", "node", "nodes_iceberg")
+    logger.info("%s: node geometry built, merging into %s", label, nodes_table)
     merge_upsert_delete(spark, nodes_table, "nodes_iceberg", "osc_node_deletes")
     if seq is not None:
         set_last_applied_sequence(spark, nodes_table, seq)
@@ -477,6 +479,7 @@ def _apply_way_section(
         node_to_ways, "dirty_ways",
     )
     spark.sql("SELECT DISTINCT id FROM dirty_ways").persist().createOrReplaceTempView("_dirty_way_ids")
+    logger.info("%s: computed dirty ways (direct + node-widened)", label)
 
     spark.sql(f"""
         SELECT *, ST_GeomFromWKB(geometry) AS geom
@@ -487,11 +490,14 @@ def _apply_way_section(
         )
     """).createOrReplaceTempView("nodes_with_geom")
 
+    logger.info("%s: building way geometry", label)
     build_way_linestrings(spark, "dirty_ways", "nodes_with_geom", "dirty_ways_lines")
     promote_closed_ways_to_areas(spark, "dirty_ways_lines", "dirty_ways_geom")
     prepare_for_iceberg(spark, "dirty_ways_geom", "way", "ways_iceberg")
+    logger.info("%s: way geometry built, merging into %s", label, ways_table)
     merge_upsert_delete(spark, ways_table, "ways_iceberg", "osc_way_deletes")
 
+    logger.info("%s: refreshing node_to_ways index", label)
     refresh_node_to_ways(spark, ways_table, node_to_ways, "_dirty_way_ids")
     spark.sql(f"DELETE FROM {node_to_ways} WHERE way_id IN (SELECT id FROM osc_way_deletes)")
     if seq is not None:
@@ -529,6 +535,7 @@ def _apply_relation_section(
     spark.sql(
         "SELECT DISTINCT id FROM dirty_relations"
     ).persist().createOrReplaceTempView("_dirty_rel_ids")
+    logger.info("%s: computed dirty relations (direct + widened)", label)
 
     spark.sql(f"""
         SELECT *, ST_GeomFromWKB(geometry) AS geom
@@ -551,6 +558,7 @@ def _apply_relation_section(
     """).createOrReplaceTempView("nodes_with_geom")
 
     relations_need_geometry(spark, "dirty_relations", "rels_need_geom")
+    logger.info("%s: building relation geometry", label)
     construct_multipolygon(
         spark, "rels_need_geom", "ways_with_geom", "rels_geom",
         nodes_geometry="nodes_with_geom",
@@ -560,8 +568,13 @@ def _apply_relation_section(
         ways_geometry="ways_with_geom", nodes_geometry="nodes_with_geom",
     )
     prepare_for_iceberg(spark, "dirty_rels_geom", "relation", "relations_iceberg")
+    relations_to_merge = spark.table("relations_iceberg").persist()
+    logger.info("%s: relation geometry built (%d rows), merging into %s",
+                label, relations_to_merge.count(), relations_table)
     merge_upsert_delete(spark, relations_table, "relations_iceberg", "osc_relation_deletes")
+    relations_to_merge.unpersist()
 
+    logger.info("%s: refreshing relation indexes", label)
     refresh_way_to_relations(spark, relations_table, way_to_relations, "_dirty_rel_ids")
     spark.sql(
         f"DELETE FROM {way_to_relations} WHERE relation_id IN (SELECT id FROM osc_relation_deletes)"

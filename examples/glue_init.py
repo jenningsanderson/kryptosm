@@ -38,14 +38,14 @@ from kryptosm import (
 )
 from kryptosm.iceberg import table_exists
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import array, coalesce, col, lit
 from sedona.spark import SedonaContext
 
 # ---------------------------------------------------------------------------
 # Config — edit these for your environment
 # ---------------------------------------------------------------------------
-INPUT_PARQUET = "s3://meta-overture-staging/planet-iceberg/raw/"
-WAREHOUSE     = "s3://meta-overture-staging/transportation-splitter/planet-iceberg/warehouse/"
+INPUT_PARQUET = "s3://YOUR-BUCKET/osm/raw/"
+WAREHOUSE     = "s3://YOUR-BUCKET/warehouse/"
 db = KryptonDatabase(catalog="glue_catalog", db_name="kryptosm")
 
 # When True, do NOT drop/recreate existing tables, and skip any per-type write
@@ -70,17 +70,9 @@ logger.info("  warehouse: %s", WAREHOUSE)
 
 # ---------------------------------------------------------------------------
 # Spark / Sedona / Iceberg session
-#
-# NOTE on `-Djts.overlay=ng`: this flag MUST be set as a Glue Job parameter
-# (`--conf spark.driver.extraJavaOptions=-Djts.overlay=ng` and the executor
-# equivalent) — the in-script `.config(...)` calls below are silently ignored
-# on Glue because Glue starts the JVM before this script runs. The lines are
-# kept here so the script also works under a fresh `spark-submit` locally.
 # ---------------------------------------------------------------------------
 spark = SedonaContext.create(
     SparkSession.builder.appName(f"kryptosm-init-{db.db_name}")
-    .config("spark.driver.extraJavaOptions", "-Djts.overlay=ng")
-    .config("spark.executor.extraJavaOptions", "-Djts.overlay=ng")
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
     .config("spark.kryo.registrator", "org.apache.sedona.core.serde.SedonaKryoRegistrator")
     .config(
@@ -95,16 +87,6 @@ spark = SedonaContext.create(
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     .getOrCreate()
 )
-
-# Confirm the JTS overlay engine that's actually active on the driver JVM.
-spark.sparkContext._jvm.System.setProperty("jts.overlay", "ng")
-_jts_overlay = spark.sparkContext._jvm.System.getProperty("jts.overlay")
-logger.info("jts.overlay (driver) = %r  (expect 'ng')", _jts_overlay)
-if _jts_overlay != "ng":
-    logger.warning(
-        "jts.overlay is not 'ng' on the driver — programmatic setProperty "
-        "did not take effect. Relations stage may fail."
-    )
 
 
 def _has_rows(name: str) -> bool:
@@ -150,31 +132,19 @@ else:
 # ---------------------------------------------------------------------------
 logger.info("[2/8] Register input Parquet views")
 base = INPUT_PARQUET.rstrip("/")
-spark.read.parquet(f"{base}/type=node").createOrReplaceTempView("input_nodes_raw")
-spark.read.parquet(f"{base}/type=way").createOrReplaceTempView("input_ways_raw_pq")
-spark.read.parquet(f"{base}/type=relation").createOrReplaceTempView("input_relations_raw")
-# At the parquet source boundary, coerce changeset NULLs to 0 and add an
-# empty additional_changesets column. This gives every downstream view a
-# uniform shape — no special-case for first apply.
-spark.sql("""
-    SELECT * EXCEPT (changeset),
-           COALESCE(changeset, 0)         AS changeset,
-           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
-    FROM input_nodes_raw
-""").createOrReplaceTempView("input_nodes")
-spark.sql("""
-    SELECT * EXCEPT (changeset),
-           COALESCE(changeset, 0)         AS changeset,
-           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
-    FROM input_ways_raw_pq
-""").createOrReplaceTempView("input_ways_raw")
-flatten_way_refs(spark, "input_ways_raw", "input_ways")
-spark.sql("""
-    SELECT * EXCEPT (changeset),
-           COALESCE(changeset, 0)         AS changeset,
-           CAST(array() AS ARRAY<BIGINT>) AS additional_changesets
-    FROM input_relations_raw
-""").createOrReplaceTempView("input_relations")
+spark.read.parquet(f"{base}/type=node") \
+    .withColumn("changeset", coalesce(col("changeset"), lit(0))) \
+    .withColumn("additional_changesets", array().cast("array<bigint>")) \
+    .createOrReplaceTempView("input_nodes")
+spark.read.parquet(f"{base}/type=way") \
+    .withColumn("changeset", coalesce(col("changeset"), lit(0))) \
+    .withColumn("additional_changesets", array().cast("array<bigint>")) \
+    .createOrReplaceTempView("input_ways_raw_pq")
+flatten_way_refs(spark, "input_ways_raw_pq", "input_ways")
+spark.read.parquet(f"{base}/type=relation") \
+    .withColumn("changeset", coalesce(col("changeset"), lit(0))) \
+    .withColumn("additional_changesets", array().cast("array<bigint>")) \
+    .createOrReplaceTempView("input_relations")
 
 # ---------------------------------------------------------------------------
 # [3/8] Build + write nodes  (skipped on RESUME if already present)

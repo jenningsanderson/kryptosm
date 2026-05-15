@@ -109,18 +109,22 @@ def test_init():
                 FROM input_relations_raw
             """).createOrReplaceTempView("input_relations")
 
-        with stage("Build + write nodes"):
+        with stage("Build node geometry"):
             build_node_geometry(spark, "input_nodes", "nodes_with_geom")
             prepare_for_iceberg(spark, "nodes_with_geom", "node", "nodes_final")
+
+        with stage("Write nodes to Iceberg"):
             spark.sql("SELECT * FROM nodes_final") \
                 .repartitionByRange(20, col("id")) \
                 .writeTo(region.nodes_table).using("iceberg").append()
             load_with_geom(spark, region.nodes_table, "nodes_with_geom")
 
-        with stage("Build + write ways"):
+        with stage("Build way geometry"):
             build_way_linestrings(spark, "input_ways", "nodes_with_geom", "ways_linestrings")
             promote_closed_ways_to_areas(spark, "ways_linestrings", "ways_with_geom")
             prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final")
+
+        with stage("Write ways to Iceberg"):
             spark.sql("SELECT * FROM ways_final") \
                 .repartitionByRange(10, col("id")) \
                 .writeTo(region.ways_table).using("iceberg").append()
@@ -129,7 +133,7 @@ def test_init():
         with stage("Populate node_to_ways index"):
             populate_node_to_ways(spark, region.ways_table, region.node_to_ways)
 
-        with stage("Build + write relations"):
+        with stage("Scope ways + nodes for relations"):
             spark.sql("""
                 SELECT DISTINCT member.ref AS id
                 FROM (SELECT explode(members) AS member FROM input_relations)
@@ -154,6 +158,7 @@ def test_init():
             """).persist()
             nodes_for_rels.createOrReplaceTempView("nodes_for_relations")
 
+        with stage("Build relation geometry"):
             relations_need_geometry(spark, "input_relations", "relations_need_geom")
             construct_multipolygon(spark, "relations_need_geom", "ways_for_relations", "relations_geom",
                                    nodes_geometry="nodes_for_relations")
@@ -162,6 +167,8 @@ def test_init():
                 ways_geometry="ways_for_relations", nodes_geometry="nodes_for_relations",
             )
             prepare_for_iceberg(spark, "relations_with_geom", "relation", "relations_final")
+
+        with stage("Write relations to Iceberg"):
             spark.sql("SELECT * FROM relations_final") \
                 .repartitionByRange(20, col("id")) \
                 .writeTo(region.relations_table).using("iceberg").append()
