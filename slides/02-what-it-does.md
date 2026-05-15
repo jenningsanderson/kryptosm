@@ -5,9 +5,9 @@
 
 #### Three operations
 
-1. **Init** — read an OSM Parquet extract, build geometries with Sedona SQL, write to a single Iceberg table partitioned by `type`
+1. **Init** — read an OSM Parquet extract, build geometries with Sedona SQL, write to three per-type Iceberg tables with type-specific tuning
 
-2. **Incremental update** — fetch OSC change files from Geofabrik, compute the dependency-aware dirty set, MERGE into the table — one Iceberg snapshot per OSC file
+2. **Incremental update** — fetch OSC change files from Geofabrik, compute the dependency-aware dirty set, MERGE into the per-type tables — one Iceberg snapshot per OSC file, per table
 
 3. **Inspect** — diff snapshots to produce GeoJSON + an interactive HTML map showing geometry and tag changes over time
 

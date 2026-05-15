@@ -5,7 +5,7 @@ class: hero
 
 ## OpenStreetMap → Apache Iceberg
 
-One table. Every node, way, and relation. Kept current with incremental OSC change files.
+Three per-type tables. Every node, way, and relation. Kept current with incremental OSC change files.
 
 Note:
-PySpark + Apache Sedona for geometry construction. Apache Iceberg for versioned, time-travel-capable table storage.
+PySpark + Apache Sedona for geometry construction. Apache Iceberg for versioned, time-travel-capable table storage. Runs on Glue, EMR, Databricks, or local Spark.

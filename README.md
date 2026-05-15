@@ -168,8 +168,9 @@ spark.sql("SELECT * FROM nodes_final").writeTo(NODES).using("iceberg").append()
 load_with_geom(spark, NODES, "nodes_with_geom")
 
 # Ways
-build_linestring_for_ways(spark, "input_ways", "nodes_with_geom", "ways_lines")
-build_ways_geometry_from_linestring(spark, "ways_lines", "ways_with_geom")
+flatten_way_refs(spark, "input_ways_raw", "input_ways")
+build_way_linestrings(spark, "input_ways", "nodes_with_geom", "ways_lines")
+promote_closed_ways_to_areas(spark, "ways_lines", "ways_with_geom")
 prepare_for_iceberg(spark, "ways_with_geom", "way", "ways_final")
 spark.sql("SELECT * FROM ways_final").writeTo(WAYS).using("iceberg").append()
 load_with_geom(spark, WAYS, "ways_with_geom")
@@ -230,6 +231,7 @@ kryptosm/
         relations.py     — MultiPolygon / MultiLineString per relation
         osc_apply.py     — dirty-set computation using index tables
         iceberg_prep.py  — geom → WKB + bbox for Iceberg write
+        samples.py       — GeoJSON sample writer for manual inspection
 
 tests/
     __init__.py              — Spark session factory for tests
@@ -237,9 +239,6 @@ tests/
     test_e2e_osc.py          — fetch + apply the next OSC (idempotent)
     test_e2e_osc_all.py      — fetch + apply all pending OSCs
     test_inspect.py          — snapshot inspector
-    test_e2e_nodes.py        — stage 1: nodes only
-    test_e2e_ways.py         — stage 2: ways only
-    test_e2e_relations.py    — stage 3: relations only
     test_replication.py      — replication unit + live tests
     data/WashingtonDC/       — DC OSM extract as Parquet
 ```
@@ -264,23 +263,26 @@ applies exactly one file. When the table is current, it prints
 
 ```
 Raw Parquet (type=node/way/relation)
-  ├── nodes.py     → ST_Point per node            → nodes_with_geom
-  ├── ways.py      → join refs → node geom        → ways_with_geom
-  └── relations.py → join members → way geom       → relations_with_geom
-      each → iceberg_prep.py (geom→WKB+bbox) → writeTo(iceberg)
+  ├── nodes.py     → ST_Point per node              → nodes_with_geom
+  ├── ways.py      → join refs → node geom          → ways_with_geom
+  └── relations.py → join members → way geom        → relations_with_geom
+      each → iceberg_prep.py (geom→WKB+bbox) → writeTo(per-type Iceberg table)
 ```
+
+Each step is a `createOrReplaceTempView`. Spark plans the full DAG and materializes only at `writeTo`. Between types, the pipeline re-binds from the materialized Iceberg table so downstream stages read storage rather than re-executing upstream views.
 
 ### Incremental update (per OSC file)
 
 ```
 OSC XML → parse → dedup (latest version per id+type)
 
-  ├── nodes:     build geometry → MERGE
-  ├── ways:      node_to_ways index → dirty set → build geometry → MERGE
-  └── relations: way_to_relations index → dirty set → build geometry → MERGE
+  ├── nodes:     build geometry → MERGE into nodes table
+  ├── ways:      node_to_ways index → dirty set → rebuild → MERGE into ways table
+  └── relations: way_to_relations + node_to_relations + relation_to_relations
+                 → dirty set → rebuild → MERGE into relations table
 
   Re-bind from Iceberg between types so each phase reads materialized data.
-  Update index tables after each type.
+  Update index tables after each type. Stamp last-applied-osc-sequence per table.
 ```
 
 ## Dependencies
