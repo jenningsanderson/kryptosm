@@ -23,7 +23,11 @@ Hygiene applied at the WKB boundary (see ``_hygienic_geom``):
 The pipeline order is deliberate; see ``_hygienic_geom`` for rationale.
 """
 
+import logging
+
 from pyspark.sql import SparkSession
+
+logger = logging.getLogger(__name__)
 
 # Relation WKB above this size gets simplified before write so the BINARY
 # column doesn't blow up. ~30 MB is well below Parquet page-size pain points.
@@ -148,6 +152,7 @@ def prepare_for_iceberg(
     run, this filter prevents ``MERGE_CARDINALITY_VIOLATION`` errors. We
     keep the row with the highest version, breaking ties by latest_ts.
     """
+    logger.info("prepare_for_iceberg: %s (type=%s) → %s", data_view, osm_type, result_view)
     if osm_type == "node":
         # Nodes: lat/lon, no bbox. NULL geom rows dropped.
         spark.sql(f"""

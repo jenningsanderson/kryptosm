@@ -148,6 +148,7 @@ def create_spark_session_for_testing(
         .config("spark.sql.catalog.hadoop_catalog", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.hadoop_catalog.type", "hadoop")
         .config("spark.sql.catalog.hadoop_catalog.warehouse", warehouse_dir)
+        .config("spark.sql.debug.maxToStringFields", "200")
         .config("spark.driver.memory", driver_memory)
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.host", "127.0.0.1")

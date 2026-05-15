@@ -15,9 +15,12 @@ pipeline actually uses for that type. ``dirty_ways`` carries no
 columns either.
 """
 
+import logging
 from typing import Optional
 
 from pyspark.sql import SparkSession
+
+logger = logging.getLogger(__name__)
 
 
 def all_dirty_ways(
@@ -39,6 +42,7 @@ def all_dirty_ways(
     base-row array (the historical accumulation from prior applies) so a
     re-MERGE'd row preserves every previously-stored changeset.
     """
+    logger.info("all_dirty_ways: direct + node-widened → %s", result_view)
     spark.sql(f"""
         SELECT
             COALESCE(a.id, b.id)               AS id,
@@ -107,6 +111,7 @@ def all_dirty_relations(
         with already-dirty-by-way relations because that would require
         fixed-point iteration.
     """
+    logger.info("all_dirty_relations: direct + widened → %s", result_view)
     union_parts = [
         f"""SELECT DISTINCT relation_id
             FROM {way_to_relations_table}

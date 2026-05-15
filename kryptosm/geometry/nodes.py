@@ -5,7 +5,11 @@ A node is the simplest OSM primitive - just a coordinate. Everything else
 (ways, relations) is built from references to nodes.
 """
 
+import logging
+
 from pyspark.sql import SparkSession
+
+logger = logging.getLogger(__name__)
 
 
 def build_node_geometry(spark: SparkSession, nodes_data: str, result_view: str):
@@ -35,6 +39,7 @@ def build_node_geometry(spark: SparkSession, nodes_data: str, result_view: str):
           fall back to wall-clock — feature temporal data must come from
           OSM (base or OSC), never from ``current_timestamp()``.
     """
+    logger.info("build_node_geometry: %s → %s", nodes_data, result_view)
     spark.sql(f"""
         SELECT id,
                CAST(version AS BIGINT)              AS version,

@@ -5,7 +5,11 @@ A way is an ordered list of node references. Closed ways with area-like
 tags become polygons; everything else stays a linestring.
 """
 
+import logging
+
 from pyspark.sql import SparkSession
+
+logger = logging.getLogger(__name__)
 
 # Tag keys that, on a closed way, mark it as an area (polygon).
 # Source: https://wiki.openstreetmap.org/wiki/Key:area
@@ -84,6 +88,7 @@ def build_way_linestrings(
               "> self.changeset" filter bounds that side from growing
               unboundedly over the way's lifetime.
     """
+    logger.info("build_way_linestrings: %s + %s → %s", ways_data, nodes_geometry, result_view)
     spark.sql(f"""
         SELECT
             a.id, a.version, a.timestamp, a.uid, a.user, a.changeset, a.tags,
@@ -134,10 +139,12 @@ def flatten_way_refs(spark: SparkSession, raw_ways: str, result_view: str):
           Doing the flatten once here keeps the rest of the pipeline working
           on a single canonical shape.
     """
+    logger.info("flatten_way_refs: %s → %s", raw_ways, result_view)
     spark.sql(f"""
         SELECT id, version, timestamp, uid, user, changeset, tags, lat, lon,
                transform(nds, x -> x.ref) AS refs,
-               members
+               members,
+               additional_changesets
         FROM {raw_ways}
     """).createOrReplaceTempView(result_view)
 
@@ -164,6 +171,7 @@ def promote_closed_ways_to_areas(
         - ST_ForcePolygonCCW normalizes winding order so consumers can
           render exteriors consistently.
     """
+    logger.info("promote_closed_ways_to_areas: %s → %s", ways_linestrings, result_view)
     spark.sql(f"""
         SELECT
             id, version, timestamp, uid, user, changeset, tags,

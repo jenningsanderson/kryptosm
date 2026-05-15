@@ -10,9 +10,12 @@ single ID with role labels. The `tags['type']` decides what we build:
 All other relation types are kept in the table with NULL geometry.
 """
 
+import logging
 from typing import Optional
 
 from pyspark.sql import SparkSession
+
+logger = logging.getLogger(__name__)
 
 # Relation `tags['type']` values for which we build geometry.
 GEOMETRY_RELATION_TYPES = (
@@ -45,6 +48,7 @@ def relations_need_geometry(spark: SparkSession, relations_data: str, result_vie
           but they get a NULL geometry. Filtering early keeps the heavy
           ST_BuildArea / ST_Union_Aggr work focused.
     """
+    logger.info("relations_need_geometry: %s → %s", relations_data, result_view)
     spark.sql(f"""
         SELECT id, members, tags,
                CAST(timestamp AS TIMESTAMP) AS latest_ts
@@ -63,6 +67,7 @@ def construct_multipolygon(
     ``nodes_geometry`` is optional. When provided, site relations can include
     node members as points in a GeometryCollection alongside any way members.
     """
+    logger.info("construct_multipolygon: %s + %s → %s", relations_data, ways_geometry, result_view)
     # ----- pre-explode direct way members ------------------------------------
     # Normalize roles: 'outline' (building/bridge) → 'outer',
     # 'part' (building) → 'outer' (each part is a polygon in the MultiPolygon).
@@ -316,6 +321,7 @@ def relation_merge_geometry_data(
     Sub-relation members are not recursed; their own changesets are reachable
     via their own ``additional_changesets`` columns.
     """
+    logger.info("relation_merge_geometry_data: %s + %s → %s", relations_data, geometry_only_data, result_view)
     if ways_geometry:
         # Only compute fallback for relations that construct_multipolygon
         # didn't produce geometry for — avoids exploding all members.

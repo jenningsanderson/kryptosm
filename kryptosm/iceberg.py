@@ -740,6 +740,10 @@ def merge_upsert_delete(
 
     Delete rows are padded with NULLs and routed to the DELETE clause via
     a ``version IS NULL`` sentinel (real upserts always have a version).
+
+    Deletes take precedence: if an ID appears in both the upsert and delete
+    views (e.g. a node-widened way that the OSC also deletes), the upsert
+    side is excluded so each ID appears exactly once in the MERGE source.
     """
     cols = spark.table(table_name).columns
     null_selects = ", ".join(
@@ -750,6 +754,7 @@ def merge_upsert_delete(
         MERGE INTO {table_name} t
         USING (
             SELECT * FROM {upsert_view}
+            WHERE id NOT IN (SELECT id FROM {delete_view})
             UNION ALL
             SELECT {null_selects} FROM {delete_view} d
         ) s
